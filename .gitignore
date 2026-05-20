@@ -1,0 +1,28 @@
+# ── Environment ──
+.env
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Virtual Env ──
+venv/
+.venv/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Docker ──
+*.log
+
+# ── OS ──
+.DS_Store
+Thumbs.db

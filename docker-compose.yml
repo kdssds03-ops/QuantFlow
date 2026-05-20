@@ -1,0 +1,143 @@
+# ────────────────────────────────────────────────────────────
+# QuantFlow — Docker Compose
+# 24시간 자동매매 시스템 인프라
+# ────────────────────────────────────────────────────────────
+#
+# 서비스 구성 및 마이그레이션 책임:
+#   1. postgres   — 거래 데이터 영구 저장
+#   2. redis      — Celery 브로커 + 캐시
+#   3. api        — FastAPI REST 서버 + Alembic 마이그레이션 책임자
+#   4. worker     — Celery 워커 (매매 로직 실행) ← api 헬스체크 후 기동
+#   5. beat       — Celery Beat (주기적 스케줄러) ← api 헬스체크 후 기동
+#
+# 마이그레이션 아키텍처:
+#   api 서비스의 entrypoint-api.sh가 DB 마이그레이션을 단독 책임.
+#   worker/beat는 api 서비스가 healthy 상태가 된 이후에만 기동됨.
+#   이를 통해 마이그레이션 중 워커가 구 스키마로 쿼리하는 레이스 컨디션 차단.
+# ────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: qf-postgres
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ──────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: qf-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI 서버 + Alembic 마이그레이션 ───
+  # [마이그레이션 책임자]
+  # entrypoint-api.sh가 다음 순서로 실행:
+  #   1. alembic/ 미존재 시 → alembic init + env.py/ini 자동 패치
+  #   2. alembic_version 미존재 시 → revision --autogenerate + upgrade head
+  #   3. alembic_version 존재 시 → upgrade head (증분 마이그레이션)
+  #   4. FastAPI 서버 기동
+  api:
+    build: .
+    container_name: qf-api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/opt/quantflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 마이그레이션 파이프라인 엔트리포인트 연결
+    entrypoint: ["/bin/bash", "/opt/quantflow/scripts/entrypoint-api.sh"]
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+    healthcheck:
+      # FastAPI /health 엔드포인트가 200을 반환해야 healthy
+      # (마이그레이션 완료 후 서버가 기동된 시점에만 200 반환)
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ── Celery Worker ──────────────────────────
+  # ⚠ api 서비스가 healthy 상태(마이그레이션 완료 + 서버 기동)가 된 후에만 기동
+  worker:
+    build: .
+    container_name: qf-worker
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
+    command: >
+      celery -A worker.celery_app worker
+      --loglevel=${LOG_LEVEL:-INFO}
+      --concurrency=2
+      -Q default,trading,market_data
+    volumes:
+      - .:/opt/quantflow
+      # 호스트 시간대 마운트 (Linux/Mac/WSL)
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+  # ── Celery Beat (스케줄러) ─────────────────
+  # ⚠ api 서비스가 healthy 상태(마이그레이션 완료 + 서버 기동)가 된 후에만 기동
+  beat:
+    build: .
+    container_name: qf-beat
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
+    command: >
+      celery -A worker.celery_app beat
+      --loglevel=${LOG_LEVEL:-INFO}
+      --schedule=/opt/quantflow/celerybeat-schedule
+    volumes:
+      - .:/opt/quantflow
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  redis_data:

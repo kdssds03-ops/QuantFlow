@@ -69,6 +69,12 @@ services:
       - "8000:8000"
     volumes:
       - .:/opt/quantflow
+      # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
+      - /opt/quantflow/app/__pycache__
+      - /opt/quantflow/core/__pycache__
+      - /opt/quantflow/worker/__pycache__
+      # 호스트 시간대 마운트 (WSL2/Linux)
+      - /etc/localtime:/etc/localtime:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -105,6 +111,10 @@ services:
       -Q default,trading,market_data
     volumes:
       - .:/opt/quantflow
+      # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
+      - /opt/quantflow/app/__pycache__
+      - /opt/quantflow/core/__pycache__
+      - /opt/quantflow/worker/__pycache__
       # 호스트 시간대 마운트 (Linux/Mac/WSL)
       - /etc/localtime:/etc/localtime:ro
     depends_on:
@@ -129,6 +139,10 @@ services:
       --schedule=/opt/quantflow/celerybeat-schedule
     volumes:
       - .:/opt/quantflow
+      # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
+      - /opt/quantflow/app/__pycache__
+      - /opt/quantflow/core/__pycache__
+      - /opt/quantflow/worker/__pycache__
       - /etc/localtime:/etc/localtime:ro
     depends_on:
       postgres:

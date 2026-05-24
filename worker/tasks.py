@@ -6,6 +6,11 @@ Phase 3: 실전 거래소 주문 집행 레이어 고도화
   - Strict Error Catching: InsufficientFunds/InvalidOrder 즉시 REJECTED 처리
   - 주문 체결 사후 정산 폴링: open 상태 주문 최대 5초 추적 → 미체결 강제 취소
   - 텔레그램 연동 캡슐화: 상태별(FILLED/PARTIALLY_FILLED/REJECTED) 차별화 알림
+
+Phase 5 (Timezone & Warmup Fix):
+  - UTC 타임존 강제 정규화: 모든 타임스탬프를 timezone-aware UTC로 통일
+  - DB Warm-up: 봇 재시작 시 DB 과거 500봉으로 지표 재계산 → NULL 레코드 일괄 upsert
+  - OHLCV 수집 limit 500봉으로 확대 → EMA50/SMA20 warm-up NaN 원천 차단
 """
 
 import logging
@@ -438,7 +443,168 @@ def _execute_order_pipeline(
 
 
 # ─────────────────────────────────────────────
-# 📡 시세 데이터 수집 & DB 저장 (유지)
+# 🔧 UTC 타임스탬프 정규화 헬퍼
+# ─────────────────────────────────────────────
+def _ensure_utc(ts_ms: int) -> datetime:
+    """
+    거래소 반환 밀리초 Unix 타임스탬프(항상 UTC)를 timezone-aware UTC datetime으로 변환.
+
+    ── 타임존 버그 방어 전략 ──────────────────────────────────────────────────
+    Binance (including demo-fapi) OHLCV timestamp는 항상 UTC milliseconds.
+    Python의 datetime.fromtimestamp()는 로컬 시스템 시간대(KST)를 기준으로 변환하므로
+    반드시 tz=timezone.utc 를 명시하여 UTC를 강제해야 합니다.
+    """
+    return datetime.fromtimestamp(int(ts_ms) / 1000.0, tz=timezone.utc)
+
+
+def _to_dec(val) -> Decimal | None:
+    """float/Decimal NaN 및 None을 안전하게 None으로 변환 후 Decimal 반환."""
+    if val is None:
+        return None
+    if isinstance(val, float) and math.isnan(val):
+        return None
+    try:
+        d = Decimal(str(val))
+        if d.is_nan():
+            return None
+        return d
+    except Exception:
+        return None
+
+
+# ─────────────────────────────────────────────
+# 🔄 DB Warm-up: 재시작 시 과거 데이터로 지표 재계산
+# ─────────────────────────────────────────────
+def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
+    """
+    봇 재시작 시 DB에 저장된 최근 lookback 개 캔들을 읽어
+    compute_all_features()로 지표를 재계산하고, 지표값이 NULL인 레코드를 일괄 upsert.
+
+    ── 해결하는 문제 ──────────────────────────────────────────────────────────
+    봇 최초 기동 또는 재시작 직후에 메모리 큐가 비어 있어 발생하는 초기 NaN 루프를
+    DB에 이미 누적된 과거 데이터를 활용하여 즉시 해소합니다.
+
+    Returns:
+        upsert된 레코드 수
+    """
+    logger.info(
+        "🔄 [DB Warm-up] 시작 — symbol=%s, lookback=%d봉", symbol, lookback
+    )
+    try:
+        session = _SyncSession()
+        try:
+            from sqlalchemy import asc
+            rows = (
+                session.query(MarketData)
+                .filter(MarketData.symbol == symbol)
+                .order_by(desc(MarketData.timestamp))
+                .limit(lookback)
+                .all()
+            )
+        finally:
+            session.close()
+
+        if not rows:
+            logger.warning("🔄 [DB Warm-up] DB에 저장된 데이터 없음 — Warm-up 스킵")
+            return 0
+
+        # 시간 오름차순 정렬 (oldest → newest)
+        rows.reverse()
+
+        # ── 타임존 방어 코드: DB 레코드의 timestamp를 UTC-aware로 정규화 ──────
+        # PostgreSQL DateTime(timezone=True) 컬럼은 timezone-aware를 반환하지만,
+        # 혹시 naive datetime이 섞여 있을 경우를 대비하여 강제 정규화
+        def _normalize_ts(ts: datetime) -> datetime:
+            if ts is None:
+                return ts
+            if ts.tzinfo is None:
+                # naive datetime → UTC로 가정하고 tz 부여
+                return ts.replace(tzinfo=timezone.utc)
+            # timezone-aware이면 UTC로 변환
+            return ts.astimezone(timezone.utc)
+
+        # DataFrame 재구성 (OHLCV만 — 지표는 재계산)
+        df_rows = []
+        for r in rows:
+            df_rows.append({
+                "timestamp_ms": int(_normalize_ts(r.timestamp).timestamp() * 1000),
+                "open":   float(r.open),
+                "high":   float(r.high),
+                "low":    float(r.low),
+                "close":  float(r.close),
+                "volume": float(r.volume),
+            })
+
+        df = pd.DataFrame(df_rows)
+
+        # ── compute_all_features: 연속 시계열 정렬 검증 ──────────────────────
+        # timestamp_ms 컬럼으로 정렬하여 시간 불연속(타임존 혼재로 인한 순서 역전) 방지
+        df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
+
+        from worker.indicators import compute_all_features
+        df = compute_all_features(df)
+
+        # ── NULL 지표 레코드만 선별하여 upsert ──────────────────────────────
+        upsert_count = 0
+        for i, r in enumerate(rows):
+            row_feat = df.iloc[i]
+            sma_20_val   = _to_dec(row_feat.get("sma_20"))
+            rsi_14_val   = _to_dec(row_feat.get("rsi_14"))
+            bb_upper_val = _to_dec(row_feat.get("bb_upper"))
+            bb_lower_val = _to_dec(row_feat.get("bb_lower"))
+
+            # 지표가 NULL인 행만 upsert (정상 행 불필요한 재기록 방지)
+            if r.rsi_14 is None or r.bb_upper is None or r.bb_lower is None:
+                ts_utc = _normalize_ts(r.timestamp)
+                stmt = pg_insert(MarketData).values(
+                    timestamp=ts_utc,
+                    symbol=symbol,
+                    open=Decimal(str(r.open)),
+                    high=Decimal(str(r.high)),
+                    low=Decimal(str(r.low)),
+                    close=Decimal(str(r.close)),
+                    volume=Decimal(str(r.volume)),
+                    sma_20=sma_20_val,
+                    rsi_14=rsi_14_val,
+                    bb_upper=bb_upper_val,
+                    bb_lower=bb_lower_val,
+                ).on_conflict_do_update(
+                    constraint="uq_market_data_ts_symbol",
+                    set_={
+                        "sma_20":   pg_insert(MarketData).excluded.sma_20,
+                        "rsi_14":   pg_insert(MarketData).excluded.rsi_14,
+                        "bb_upper": pg_insert(MarketData).excluded.bb_upper,
+                        "bb_lower": pg_insert(MarketData).excluded.bb_lower,
+                    },
+                )
+                for session in _get_sync_session():
+                    session.execute(stmt)
+                upsert_count += 1
+
+        logger.info(
+            "✅ [DB Warm-up] 완료 — 처리 %d봉, 지표 upsert %d건",
+            len(rows), upsert_count
+        )
+        return upsert_count
+
+    except Exception as exc:
+        logger.error("❌ [DB Warm-up] 실패: %s", exc, exc_info=True)
+        return 0
+
+
+# ── 봇 최초 기동 시 DB Warm-up 자동 실행 ────────────────────────────────────
+try:
+    _warmup_symbol = "BTC/USDT"
+    _warmed = _warmup_from_db(symbol=_warmup_symbol, lookback=500)
+    logger.info(
+        "🔄 [DB Warm-up] 시동 완료 — %d개 NULL 지표 레코드 복원", _warmed
+    )
+except Exception as _warmup_exc:
+    logger.warning("⚠️ [DB Warm-up] 시동 중 Warm-up 실패 (봇 계속 가동): %s", _warmup_exc)
+
+
+# ─────────────────────────────────────────────
+# 📡 시세 데이터 수집 & DB 저장
 # ─────────────────────────────────────────────
 @celery_app.task(
     bind=True,
@@ -451,7 +617,10 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
     logger.info(f"📡 OHLCV 수집 및 피처 생성 시작: {symbol}")
     try:
         exchange = get_exchange()
-        ohlcv_list = exchange.fetch_ohlcv(symbol=symbol, timeframe="1m", limit=100)
+        # ── [Timezone Fix] limit 500봉: EMA50(~50봉) + SMA20 warm-up 완전 보장 ──
+        # 이전 limit=100은 봇 기동 직후 충분한 warm-up을 보장하지 못했음.
+        # 500봉은 모든 지표(EMA50, Stochastic 등)의 min_periods를 여유롭게 충족.
+        ohlcv_list = exchange.fetch_ohlcv(symbol=symbol, timeframe="1m", limit=500)
 
         if not ohlcv_list:
             logger.warning(f"⚠️ 빈 OHLCV 응답: {symbol}")
@@ -462,17 +631,18 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
             columns=["timestamp_ms", "open", "high", "low", "close", "volume"],
         ).astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
 
+        # ── [Timezone Fix] timestamp_ms 기준 오름차순 정렬 보장 ──────────────
+        # Binance OHLCV timestamp는 UTC milliseconds.
+        # 정렬을 명시하여 타임존 혼재로 인한 순서 역전을 방지.
+        df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
+
         # 피처 엔지니어링 파이프라인
         from worker.indicators import compute_all_features
         df = compute_all_features(df)
 
         last = df.iloc[-1]
-        candle_dt = datetime.fromtimestamp(int(last["timestamp_ms"]) / 1000.0, tz=timezone.utc)
-
-        def _to_dec(val):
-            if val is None or (isinstance(val, float) and math.isnan(val)):
-                return None
-            return Decimal(str(val))
+        # ── [Timezone Fix] UTC timezone-aware datetime 강제 보장 ─────────────
+        candle_dt = _ensure_utc(int(last["timestamp_ms"]))
 
         sma_20   = _to_dec(last.get("sma_20"))
         rsi_14   = _to_dec(last.get("rsi_14"))
@@ -494,8 +664,12 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         )
         stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_market_data_ts_symbol",
-            set_={"sma_20": insert_stmt.excluded.sma_20, "rsi_14": insert_stmt.excluded.rsi_14,
-                  "bb_upper": insert_stmt.excluded.bb_upper, "bb_lower": insert_stmt.excluded.bb_lower},
+            set_={
+                "sma_20":   insert_stmt.excluded.sma_20,
+                "rsi_14":   insert_stmt.excluded.rsi_14,
+                "bb_upper": insert_stmt.excluded.bb_upper,
+                "bb_lower": insert_stmt.excluded.bb_lower,
+            },
         )
 
         for session in _get_sync_session():
@@ -539,6 +713,82 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             if latest is None:
                 logger.warning(f"⚠️ 분석 스킵 (MarketData 없음)")
                 return {"status": "no_data"}
+
+            # ── [Timezone Fix] latest 레코드의 지표 유효성 사전 검증 ────────────
+            # rsi_14, bb_upper, bb_lower 중 하나라도 NULL이면 RuleBasedPredictor가
+            # 즉시 HOLD를 반환하는 NaN 루프가 발생.
+            # → 이 경우 DB의 최근 500봉을 즉시 재조회하여 지표를 실시간으로 채워줌.
+            _indicators_valid = (
+                latest.rsi_14 is not None
+                and latest.bb_upper is not None
+                and latest.bb_lower is not None
+            )
+            if not _indicators_valid:
+                logger.warning(
+                    "⚠️ [analyze_and_trade] latest 레코드 지표 NULL 감지 "
+                    "(rsi_14=%s, bb_upper=%s, bb_lower=%s) → 실시간 지표 재계산 수행",
+                    latest.rsi_14, latest.bb_upper, latest.bb_lower,
+                )
+                # DB에서 최근 500봉 조회 → compute_all_features → latest 지표 패치
+                _hist_rows = (
+                    session.query(MarketData)
+                    .filter(MarketData.symbol == symbol)
+                    .order_by(desc(MarketData.timestamp))
+                    .limit(500)
+                    .all()
+                )
+                if len(_hist_rows) >= 20:  # sma_20 최소 요구 봉 수
+                    _hist_rows.reverse()  # oldest → newest
+                    _df_hist = pd.DataFrame([
+                        {
+                            "timestamp_ms": int(
+                                (_r.timestamp.astimezone(timezone.utc)
+                                 if _r.timestamp.tzinfo else
+                                 _r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
+                            ),
+                            "open":   float(_r.open),
+                            "high":   float(_r.high),
+                            "low":    float(_r.low),
+                            "close":  float(_r.close),
+                            "volume": float(_r.volume),
+                        }
+                        for _r in _hist_rows
+                    ])
+                    # timestamp_ms 기준 정렬: 타임존 혼재로 인한 순서 역전 방지
+                    _df_hist = _df_hist.sort_values(
+                        "timestamp_ms", ascending=True
+                    ).reset_index(drop=True)
+                    from worker.indicators import compute_all_features as _caf
+                    _df_hist = _caf(_df_hist)
+                    _last_feat = _df_hist.iloc[-1]
+                    # latest 객체의 지표를 메모리상으로만 패치 (DB 반영 불필요 — fetch_market_data_task가 처리)
+                    _patched_rsi    = _to_dec(_last_feat.get("rsi_14"))
+                    _patched_upper  = _to_dec(_last_feat.get("bb_upper"))
+                    _patched_lower  = _to_dec(_last_feat.get("bb_lower"))
+                    _patched_sma    = _to_dec(_last_feat.get("sma_20"))
+                    if _patched_rsi is not None:
+                        latest.rsi_14   = _patched_rsi
+                        latest.bb_upper = _patched_upper
+                        latest.bb_lower = _patched_lower
+                        latest.sma_20   = _patched_sma
+                        logger.info(
+                            "✅ [analyze_and_trade] 지표 실시간 패치 완료: "
+                            "rsi_14=%s, bb_upper=%s, bb_lower=%s",
+                            _patched_rsi, _patched_upper, _patched_lower,
+                        )
+                    else:
+                        logger.warning(
+                            "⚠️ [analyze_and_trade] 지표 재계산 후에도 NaN → "
+                            "DB 데이터 %d봉 부족 (분석 스킵)",
+                            len(_hist_rows),
+                        )
+                        return {"status": "insufficient_indicator_data"}
+                else:
+                    logger.warning(
+                        "⚠️ [analyze_and_trade] DB 데이터 부족(%d봉 < 20봉) → 분석 스킵",
+                        len(_hist_rows),
+                    )
+                    return {"status": "insufficient_data"}
 
             current_close = Decimal(str(latest.close))
 

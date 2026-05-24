@@ -7,6 +7,10 @@ Phase 4: MLPredictor 고도화 및 다중 기술적 지표 알고리즘 탑재
   - predict_proba 기반 신뢰도(Confidence) 필터링 (65% 가드라인)
   - 상식 검증 가드 (RSI·Stochastic 모순 감지 → 뇌동매매 차단)
   - RuleBasedPredictor 자동 폴백 방패 (pkl 로드 실패 / 추론 예외)
+
+Phase 5 (Timezone & NaN Fix):
+  - MLPredictor DB 조회 시 UTC timestamp 기준 정렬 적용 (타임존 혼재 방지)
+  - RuleBasedPredictor NaN 감지 로직 강화 및 WARNING 로그 금액화
 """
 
 import logging
@@ -14,6 +18,7 @@ import math
 import os
 import pickle
 from abc import ABC, abstractmethod
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Tuple, Dict, Any, Optional
 
@@ -174,7 +179,9 @@ class RuleBasedPredictor(BasePredictor):
         # Decimal 내부의 NaN 값 체크 (방어적 프로그래밍의 일환)
         if close.is_nan() or rsi_14.is_nan() or bb_upper.is_nan() or bb_lower.is_nan():
             logger.warning(
-                "⏸️  [RuleBasedPredictor] 정밀 변환 지표 중 NaN 감지 -> HOLD 반환"
+                "⚠️  [RuleBasedPredictor] 정밀 변환 지표 중 NaN 감지 → HOLD 반환\n"
+                "   ▶ 근본 원인: DB의 지표(rsi_14/bb_upper/bb_lower)가 NULL로 저장되어 있음.\n"
+                "   ▶ 해결책: tasks.py의 _warmup_from_db() 실행 또는 fetch_market_data_task 수집 대기 중"
             )
             return "HOLD", 0.0
 
@@ -515,15 +522,29 @@ class MLPredictor(BasePredictor):
             df = pd.DataFrame(
                 [
                     {
-                        "open": float(r.open),
-                        "high": float(r.high),
-                        "low": float(r.low),
-                        "close": float(r.close),
+                        # ── [Timezone Fix] timestamp를 UTC-aware로 정규화 ────────────────
+                        # DB DateTime(timezone=True) 콼럼은 timezone-aware를 반환하지만,
+                        # 혼재 naive datetime이 있을 경우를 대비하여 UTC millisecond로 정규화
+                        "timestamp_ms": int(
+                            (
+                                r.timestamp.astimezone(timezone.utc)
+                                if r.timestamp.tzinfo is not None
+                                else r.timestamp.replace(tzinfo=timezone.utc)
+                            ).timestamp() * 1000
+                        ),
+                        "open":   float(r.open),
+                        "high":   float(r.high),
+                        "low":    float(r.low),
+                        "close":  float(r.close),
                         "volume": float(r.volume),
                     }
                     for r in rows
                 ]
             )
+            # ── [Timezone Fix] timestamp_ms 기준 오름차순 정렬 적용 ────────────────
+            # UTC/KST 혼재로 인한 9시간 간격 데이터 공백(타임스탬프 순서 역전)을
+            # 방지하여 compute_all_features()가 연속 시계열로 재료를 받도록 보장
+            df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
 
             # ── STEP 6: 다중 피처 벡터 연산 (인메모리) ──────────────────
             from worker.indicators import (

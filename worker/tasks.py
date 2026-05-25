@@ -724,12 +724,8 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 and latest.bb_lower is not None
             )
             if not _indicators_valid:
-                logger.warning(
-                    "⚠️ [analyze_and_trade] latest 레코드 지표 NULL 감지 "
-                    "(rsi_14=%s, bb_upper=%s, bb_lower=%s) → 실시간 지표 재계산 수행",
-                    latest.rsi_14, latest.bb_upper, latest.bb_lower,
-                )
-                # DB에서 최근 500봉 조회 → compute_all_features → latest 지표 패치
+                # ── 매 분 신규 캔들이 NULL 지표로 INSERT되는 것은 정상 파이프라인 흐름.
+                # → DB 최근 500봉으로 지표를 재계산하여 즉시 UPDATE 영구 저장.
                 _hist_rows = (
                     session.query(MarketData)
                     .filter(MarketData.symbol == symbol)
@@ -754,38 +750,60 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         }
                         for _r in _hist_rows
                     ])
-                    # timestamp_ms 기준 정렬: 타임존 혼재로 인한 순서 역전 방지
                     _df_hist = _df_hist.sort_values(
                         "timestamp_ms", ascending=True
                     ).reset_index(drop=True)
                     from worker.indicators import compute_all_features as _caf
                     _df_hist = _caf(_df_hist)
                     _last_feat = _df_hist.iloc[-1]
-                    # latest 객체의 지표를 메모리상으로만 패치 (DB 반영 불필요 — fetch_market_data_task가 처리)
                     _patched_rsi    = _to_dec(_last_feat.get("rsi_14"))
                     _patched_upper  = _to_dec(_last_feat.get("bb_upper"))
                     _patched_lower  = _to_dec(_last_feat.get("bb_lower"))
                     _patched_sma    = _to_dec(_last_feat.get("sma_20"))
                     if _patched_rsi is not None:
+                        # ── [동시성 격리] 지표 패치 전용 독립 세션으로 UPDATE ────────
+                        # 공유 세션(session)에서 commit()을 호출하면 fetch_market_data_task
+                        # 등 동시 실행 중인 다른 태스크의 트랜잭션 상태를 오염시켜
+                        # PGRES_TUPLES_OK 충돌이 발생함.
+                        # → 패치 전용 독립 세션을 별도 생성하여 완전 격리 처리.
+                        #   메인 세션(session)의 트랜잭션은 일절 건드리지 않음.
+                        _patch_session = _SyncSession()
+                        try:
+                            from sqlalchemy import update as sa_update
+                            _patch_stmt = (
+                                sa_update(MarketData)
+                                .where(MarketData.id == latest.id)
+                                .values(
+                                    rsi_14=_patched_rsi,
+                                    bb_upper=_patched_upper,
+                                    bb_lower=_patched_lower,
+                                    sma_20=_patched_sma,
+                                )
+                            )
+                            _patch_session.execute(_patch_stmt)
+                            _patch_session.commit()
+                        except Exception as _patch_db_exc:
+                            _patch_session.rollback()
+                            logger.warning(
+                                "⚠️ [지표 패치] DB UPDATE 실패 (id=%s): %s",
+                                latest.id, _patch_db_exc,
+                            )
+                        finally:
+                            _patch_session.close()
+                        # 메모리상 객체도 동기화 (현재 턴 분석 정상 진행)
                         latest.rsi_14   = _patched_rsi
                         latest.bb_upper = _patched_upper
                         latest.bb_lower = _patched_lower
                         latest.sma_20   = _patched_sma
-                        logger.info(
-                            "✅ [analyze_and_trade] 지표 실시간 패치 완료: "
-                            "rsi_14=%s, bb_upper=%s, bb_lower=%s",
-                            _patched_rsi, _patched_upper, _patched_lower,
-                        )
                     else:
                         logger.warning(
-                            "⚠️ [analyze_and_trade] 지표 재계산 후에도 NaN → "
-                            "DB 데이터 %d봉 부족 (분석 스킵)",
+                            "⚠️ [지표 패치] 재계산 후에도 NaN — 데이터 %d봉 부족, 분석 스킵",
                             len(_hist_rows),
                         )
                         return {"status": "insufficient_indicator_data"}
                 else:
                     logger.warning(
-                        "⚠️ [analyze_and_trade] DB 데이터 부족(%d봉 < 20봉) → 분석 스킵",
+                        "⚠️ [지표 패치] DB 데이터 부족(%d봉 < 20봉) — 분석 스킵",
                         len(_hist_rows),
                     )
                     return {"status": "insufficient_data"}

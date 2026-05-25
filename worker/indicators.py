@@ -96,11 +96,17 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
 
     # RSI (Relative Strength Index) — Wilder's Smoothing (α = 1/14)
     delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = (-delta).clip(upper=0)
+    # ── [BUG FIX] 상승분/하락분 정확 분리 ────────────────────────
+    # 기존: loss = (-delta).clip(upper=0)
+    # → (-delta)는 하락시 양수가 되지만 clip(upper=0)이 그 양수를 0으로 잘라
+    #   모든 loss가 0이 되어 avg_loss=0 → RS=inf → RSI를 100에 고착시키거나
+    #   0/0 연산으로 NaN을 발생시키는 치명적 버그.
+    # 수정: .where() 로 상승분/하락분을 시그닜에 맞게 정확히 분리.
+    gain = delta.where(delta > 0, 0.0)   # 상승일 때만 양수, 나머지 0
+    loss = (-delta).where(delta < 0, 0.0) # 하락일 때만 양수, 나머지 0
     avg_gain = gain.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean()
-    # 0으로 나누기 방어: avg_loss가 0이면 RS → inf → RSI = 100 (극단적 과매수)
+    # 0으로 나누기 방어: avg_loss가 0이면 RS → inf → RSI = 100 (과매수 평단)
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
 

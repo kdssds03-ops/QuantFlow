@@ -23,6 +23,12 @@ venv/
 # ── Docker ──
 *.log
 
+# ── Celery ──
+# 쿈러리비트 스케줄러 바이너리: 컨테이너 재기동 시 잘못된 오래된 스케줄이
+# 무음으로 주입되어 태스크가 호출되지 않는 '침묵 파업'을 일으킬 수 있음.
+celerybeat-schedule
+celerybeat-schedule.db
+
 # ── OS ──
 .DS_Store
 Thumbs.db

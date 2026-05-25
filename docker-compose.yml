@@ -136,7 +136,7 @@ services:
     command: >
       celery -A worker.celery_app beat
       --loglevel=${LOG_LEVEL:-INFO}
-      --schedule=/opt/quantflow/celerybeat-schedule
+      --schedule=/tmp/celerybeat-schedule
     volumes:
       - .:/opt/quantflow
       # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록

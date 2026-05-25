@@ -132,9 +132,14 @@ else:
 # ── [Strict Rules] 정밀도 유지 및 리스크 관리 임계치 설정 ────────────────
 TRADE_AMOUNT_BTC = Decimal("0.001")     # 일반 float(0.001)에서 Decimal 구조로 정형화
 MIN_ORDER_BTC = Decimal("0.0001")       # 바이낸스 등 거래소 시장가 주문 최저 한계선 (BTC)
-COOLDOWN_MINUTES = 5              
-STOP_LOSS_THRESHOLD = Decimal("-0.0100") # -1.0% 손절 방패 임계치
+COOLDOWN_MINUTES = 5
+STOP_LOSS_THRESHOLD = Decimal("-0.0100") # -1.0% 소프트 손절 방패 (지표 기반)
 CONFIDENCE_THRESHOLD = 0.65             # 스나이퍼 진입 확신도 65% Filter
+
+# ── [8차 확장] 하드 TP/SL + 타임아웃 안전장치 임계치 ────────────────────
+HARD_SL_THRESHOLD   = Decimal("-0.0150") # -1.5% 하드 손절 컷 (무조건 강제 청산)
+HARD_TP_THRESHOLD   = Decimal("0.0300")  # +3.0% 하드 익절 타겟 (무조건 강제 수확)
+MAX_POSITION_MINUTES = 180               # 최대 포지션 보유 시간 (180분 = 3시간)
 
 # ── [Phase 3] 주문 집행 파이프라인 설정 상수 ─────────────────────────────
 _ORDER_FILL_POLL_INTERVAL_SEC = 1   # 체결 폴링 간격 (초)
@@ -142,6 +147,8 @@ _ORDER_FILL_POLL_MAX_SEC = 5        # 체결 폴링 최대 대기 시간 (초)
 _ORDER_RETRY_MAX_ATTEMPTS = 3       # 네트워크 재시도 최대 횟수
 _ORDER_RETRY_WAIT_MIN_SEC = 1       # Exponential Backoff 최소 대기 (초)
 _ORDER_RETRY_WAIT_MAX_SEC = 8       # Exponential Backoff 최대 대기 (초)
+_BALANCE_RETRY_MAX = 3              # fetch_balance 재시도 최대 횟수
+_BALANCE_RETRY_WAIT_SEC = 1         # fetch_balance 재시도 대기 (초)
 
 
 # ─────────────────────────────────────────────
@@ -473,6 +480,36 @@ def _to_dec(val) -> Decimal | None:
 
 
 # ─────────────────────────────────────────────
+# 🔁 [8차 확장] 거래소 잔고 조회 재시도 헬퍼
+# ─────────────────────────────────────────────
+def _fetch_balance_with_retry(exchange: "ccxt.Exchange") -> dict:
+    """
+    fetch_balance()를 최대 _BALANCE_RETRY_MAX 회 자동 재시도.
+
+    순간적인 네트워크 끊김이나 거래소 서버 점검으로 인해 잔고 조회가 실패할 때
+    봇 전체가 셧다운되지 않도록 1초 간격 재시도로 보호합니다.
+    모든 시도가 소진되면 마지막 예외를 re-raise합니다.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(1, _BALANCE_RETRY_MAX + 1):
+        try:
+            return exchange.fetch_balance()
+        except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
+            last_exc = exc
+            if attempt < _BALANCE_RETRY_MAX:
+                logger.warning(
+                    "⚠️ [잔고 조회] 네트워크 오류 (attempt %d/%d) — %ds 후 재시도: %s",
+                    attempt, _BALANCE_RETRY_MAX, _BALANCE_RETRY_WAIT_SEC, exc,
+                )
+                time.sleep(_BALANCE_RETRY_WAIT_SEC)
+        except Exception as exc:
+            last_exc = exc
+            logger.error("❌ [잔고 조회] 복구 불가 예외 — 재시도 없이 중단: %s", exc)
+            break
+    raise last_exc or RuntimeError("fetch_balance 알 수 없는 실패")
+
+
+# ─────────────────────────────────────────────
 # 🔄 DB Warm-up: 재시작 시 과거 데이터로 지표 재계산
 # ─────────────────────────────────────────────
 def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
@@ -644,10 +681,16 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         # ── [Timezone Fix] UTC timezone-aware datetime 강제 보장 ─────────────
         candle_dt = _ensure_utc(int(last["timestamp_ms"]))
 
-        sma_20   = _to_dec(last.get("sma_20"))
-        rsi_14   = _to_dec(last.get("rsi_14"))
-        bb_upper = _to_dec(last.get("bb_upper"))
-        bb_lower = _to_dec(last.get("bb_lower"))
+        # ── [NaN 가드] pd.isna() 기준으로 유효 숫자인지 사전 검증 ─────────────
+        # _to_dec()만으로는 numpy NaN이 통과될 수 있으므로, 변환 전 명시적 체크.
+        _raw_sma    = last.get("sma_20")
+        _raw_rsi    = last.get("rsi_14")
+        _raw_upper  = last.get("bb_upper")
+        _raw_lower  = last.get("bb_lower")
+        sma_20   = _to_dec(_raw_sma)   if not pd.isna(_raw_sma)   else None
+        rsi_14   = _to_dec(_raw_rsi)   if not pd.isna(_raw_rsi)   else None
+        bb_upper = _to_dec(_raw_upper) if not pd.isna(_raw_upper) else None
+        bb_lower = _to_dec(_raw_lower) if not pd.isna(_raw_lower) else None
 
         insert_stmt = pg_insert(MarketData).values(
             timestamp=candle_dt,
@@ -697,14 +740,14 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
     try:
         exchange = get_exchange()
         
-        # 1. 실시간 자산 잔고 트래킹 (매매 수량 동적 계산 및 알림 연동용)
+        # 1. 실시간 자산 잔고 트래킹 — 3회 자동 재시도 보장 (8차 확장)
         try:
-            balance_info = exchange.fetch_balance()
+            balance_info = _fetch_balance_with_retry(exchange)
             usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
-            usdt_free = Decimal(str(balance_info["free"].get("USDT", 0.0)))
-            btc_free = Decimal(str(balance_info["free"].get("BTC", 0.0)))
+            usdt_free    = Decimal(str(balance_info["free"].get("USDT", 0.0)))
+            btc_free     = Decimal(str(balance_info["free"].get("BTC", 0.0)))
         except Exception as e:
-            logger.error(f"❌ 실시간 지갑 잔고 조회 실패: {e} -> 매매 파이프라인 스킵")
+            logger.error("❌ 실시간 지갑 잔고 조회 최종 실패 (%d회 재시도 소진): %s", _BALANCE_RETRY_MAX, e)
             return {"status": "balance_fetch_failed"}
 
         for session in _get_sync_session():
@@ -725,7 +768,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             )
             if not _indicators_valid:
                 # ── 매 분 신규 캔들이 NULL 지표로 INSERT되는 것은 정상 파이프라인 흐름.
-                # → DB 최근 500봉으로 지표를 재계산하여 즉시 UPDATE 영구 저장.
+                # → DB 최근 500봉으로 지표를 재계산한 뒤, 유효한 숫자만 UPDATE 영구 저장.
                 _hist_rows = (
                     session.query(MarketData)
                     .filter(MarketData.symbol == symbol)
@@ -733,80 +776,107 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     .limit(500)
                     .all()
                 )
-                if len(_hist_rows) >= 20:  # sma_20 최소 요구 봉 수
-                    _hist_rows.reverse()  # oldest → newest
-                    _df_hist = pd.DataFrame([
-                        {
-                            "timestamp_ms": int(
-                                (_r.timestamp.astimezone(timezone.utc)
-                                 if _r.timestamp.tzinfo else
-                                 _r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
-                            ),
-                            "open":   float(_r.open),
-                            "high":   float(_r.high),
-                            "low":    float(_r.low),
-                            "close":  float(_r.close),
-                            "volume": float(_r.volume),
-                        }
-                        for _r in _hist_rows
-                    ])
-                    _df_hist = _df_hist.sort_values(
-                        "timestamp_ms", ascending=True
-                    ).reset_index(drop=True)
-                    from worker.indicators import compute_all_features as _caf
-                    _df_hist = _caf(_df_hist)
-                    _last_feat = _df_hist.iloc[-1]
-                    _patched_rsi    = _to_dec(_last_feat.get("rsi_14"))
-                    _patched_upper  = _to_dec(_last_feat.get("bb_upper"))
-                    _patched_lower  = _to_dec(_last_feat.get("bb_lower"))
-                    _patched_sma    = _to_dec(_last_feat.get("sma_20"))
-                    if _patched_rsi is not None:
-                        # ── [동시성 격리] 지표 패치 전용 독립 세션으로 UPDATE ────────
-                        # 공유 세션(session)에서 commit()을 호출하면 fetch_market_data_task
-                        # 등 동시 실행 중인 다른 태스크의 트랜잭션 상태를 오염시켜
-                        # PGRES_TUPLES_OK 충돌이 발생함.
-                        # → 패치 전용 독립 세션을 별도 생성하여 완전 격리 처리.
-                        #   메인 세션(session)의 트랜잭션은 일절 건드리지 않음.
-                        _patch_session = _SyncSession()
-                        try:
-                            from sqlalchemy import update as sa_update
-                            _patch_stmt = (
-                                sa_update(MarketData)
-                                .where(MarketData.id == latest.id)
-                                .values(
-                                    rsi_14=_patched_rsi,
-                                    bb_upper=_patched_upper,
-                                    bb_lower=_patched_lower,
-                                    sma_20=_patched_sma,
-                                )
-                            )
-                            _patch_session.execute(_patch_stmt)
-                            _patch_session.commit()
-                        except Exception as _patch_db_exc:
-                            _patch_session.rollback()
-                            logger.warning(
-                                "⚠️ [지표 패치] DB UPDATE 실패 (id=%s): %s",
-                                latest.id, _patch_db_exc,
-                            )
-                        finally:
-                            _patch_session.close()
-                        # 메모리상 객체도 동기화 (현재 턴 분석 정상 진행)
-                        latest.rsi_14   = _patched_rsi
-                        latest.bb_upper = _patched_upper
-                        latest.bb_lower = _patched_lower
-                        latest.sma_20   = _patched_sma
-                    else:
-                        logger.warning(
-                            "⚠️ [지표 패치] 재계산 후에도 NaN — 데이터 %d봉 부족, 분석 스킵",
-                            len(_hist_rows),
-                        )
-                        return {"status": "insufficient_indicator_data"}
-                else:
+                if len(_hist_rows) < 20:
                     logger.warning(
                         "⚠️ [지표 패치] DB 데이터 부족(%d봉 < 20봉) — 분석 스킵",
                         len(_hist_rows),
                     )
                     return {"status": "insufficient_data"}
+
+                _hist_rows.reverse()  # oldest → newest
+                _df_hist = pd.DataFrame([
+                    {
+                        "timestamp_ms": int(
+                            (_r.timestamp.astimezone(timezone.utc)
+                             if _r.timestamp.tzinfo else
+                             _r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
+                        ),
+                        "open":   float(_r.open),
+                        "high":   float(_r.high),
+                        "low":    float(_r.low),
+                        "close":  float(_r.close),
+                        "volume": float(_r.volume),
+                    }
+                    for _r in _hist_rows
+                ])
+                _df_hist = _df_hist.sort_values(
+                    "timestamp_ms", ascending=True
+                ).reset_index(drop=True)
+                from worker.indicators import compute_all_features as _caf
+                _df_hist = _caf(_df_hist)
+
+                # ── [Step 1] raw float 추출 ──────────────────────────────────
+                _last_feat  = _df_hist.iloc[-1]
+                _raw_rsi    = _last_feat.get("rsi_14")
+                _raw_upper  = _last_feat.get("bb_upper")
+                _raw_lower  = _last_feat.get("bb_lower")
+                _raw_sma    = _last_feat.get("sma_20")
+
+                # ── [Step 2] NaN 명시적 검증 — pd.isna() 기준 ───────────────
+                # _to_dec()에 넘기기 전에 반드시 유효성을 확인해야 함.
+                # pd.isna()는 float NaN / numpy NaN / None / pd.NA 모두 커버.
+                # 핵심 3개 지표 중 하나라도 NaN이면 DB UPDATE를 절대 실행하지 않음.
+                if pd.isna(_raw_rsi) or pd.isna(_raw_upper) or pd.isna(_raw_lower):
+                    logger.warning(
+                        "⚠️ [지표 패치] 재계산 후에도 NaN — 데이터 %d봉 부족, 분석 스킵",
+                        len(_hist_rows),
+                    )
+                    return {"status": "insufficient_indicator_data"}
+
+                # ── [Step 3] 유효한 숫자임이 확인된 값만 Decimal 변환 ─────────
+                _patched_rsi   = _to_dec(_raw_rsi)
+                _patched_upper = _to_dec(_raw_upper)
+                _patched_lower = _to_dec(_raw_lower)
+                _patched_sma   = _to_dec(_raw_sma)
+
+                # _to_dec 이중 안전망: 변환 후에도 None이면 UPDATE 금지
+                if _patched_rsi is None or _patched_upper is None or _patched_lower is None:
+                    logger.warning(
+                        "⚠️ [지표 패치] Decimal 변환 실패 — DB UPDATE 스킵 (id=%s)",
+                        latest.id,
+                    )
+                    return {"status": "insufficient_indicator_data"}
+
+                # ── [Step 4] 진짜 유효한 숫자만 독립 세션으로 DB UPDATE ────────
+                # 동시성 격리: 공유 세션(session)을 건드리지 않고
+                # 패치 전용 세션을 별도 생성하여 commit/rollback을 완전 격리.
+                #
+                # [커넥션 풀 누수 방어]
+                # _patch_session = None 으로 선제 초기화 후 try 내부에서 생성.
+                # → _SyncSession() 자체가 예외를 던지더라도 finally가 안전하게
+                #   실행되어 is not None 체크 후 close() 를 보장.
+                _patch_session = None
+                try:
+                    _patch_session = _SyncSession()
+                    from sqlalchemy import update as sa_update
+                    _patch_stmt = (
+                        sa_update(MarketData)
+                        .where(MarketData.id == latest.id)
+                        .values(
+                            rsi_14=_patched_rsi,
+                            bb_upper=_patched_upper,
+                            bb_lower=_patched_lower,
+                            sma_20=_patched_sma,
+                        )
+                    )
+                    _patch_session.execute(_patch_stmt)
+                    _patch_session.commit()
+                except Exception as _patch_db_exc:
+                    if _patch_session is not None:
+                        _patch_session.rollback()
+                    logger.warning(
+                        "⚠️ [지표 패치] DB UPDATE 실패 (id=%s): %s",
+                        latest.id, _patch_db_exc,
+                    )
+                finally:
+                    if _patch_session is not None:
+                        _patch_session.close()
+
+                # 메모리상 객체도 동기화 (현재 턴 분석 정상 진행)
+                latest.rsi_14   = _patched_rsi
+                latest.bb_upper = _patched_upper
+                latest.bb_lower = _patched_lower
+                latest.sma_20   = _patched_sma
 
             current_close = Decimal(str(latest.close))
 
@@ -862,6 +932,79 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     )
 
                     return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
+
+            # 4-1. ⏱️ [8차 확장] 하드 TP / 하드 SL / 타임아웃 안전장치 (우선순위 2위)
+            # ─────────────────────────────────────────────────────────────────────
+            # 지표 신호와 무관하게, 포지션이 극단적 수익/손실에 도달하거나
+            # 최대 보유 시간을 초과하면 무조건 강제 청산합니다.
+            # 기존 STOP_LOSS_SHIELD(-1.0%)보다 더 깊은 구간에서 발동하는 하드 안전망입니다.
+            if current_position == "LONG" and entry_price and last_trade:
+                price_return = (current_close - entry_price) / entry_price
+                now_utc_check = datetime.now(timezone.utc)
+
+                # 진입 시각 타임존 정규화
+                entry_ts = last_trade.timestamp
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                else:
+                    entry_ts = entry_ts.astimezone(timezone.utc)
+                minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
+
+                _hard_trigger: str | None = None
+                _hard_reason: str = ""
+
+                if minutes_held >= MAX_POSITION_MINUTES:
+                    _hard_trigger = "TIMEOUT_EXIT"
+                    _hard_reason  = f"보유 {minutes_held:.0f}분 → 최대 {MAX_POSITION_MINUTES}분 초과"
+                elif price_return >= HARD_TP_THRESHOLD:
+                    _hard_trigger = "HARD_TP_EXIT"
+                    _hard_reason  = f"수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
+                elif price_return <= HARD_SL_THRESHOLD:
+                    _hard_trigger = "HARD_SL_EXIT"
+                    _hard_reason  = f"수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
+
+                if _hard_trigger:
+                    logger.warning(
+                        "🔔 [%s] 강제 청산 발동: %s (평단=$%s, 현재=$%s)",
+                        _hard_trigger, _hard_reason, entry_price, current_close,
+                    )
+                    _hard_amount = btc_free
+                    if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
+                        logger.warning("[%s] BTC 잔고 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
+                        return {"status": "insufficient_btc_for_hard_exit"}
+
+                    _hard_result: OrderResult = _execute_order_pipeline(
+                        exchange=exchange,
+                        symbol=symbol,
+                        side="SELL",
+                        amount=_hard_amount,
+                        trigger_type=_hard_trigger,
+                        fallback_price=current_close,
+                        confidence=1.0,
+                        usdt_balance=usdt_balance,
+                    )
+                    _hard_rec_amount = (
+                        _hard_result["filled_amount"]
+                        if _hard_result["filled_amount"] > Decimal("0")
+                        else _hard_amount
+                    )
+                    session.add(TradeHistory(
+                        timestamp=datetime.now(timezone.utc), symbol=symbol, side="SELL",
+                        price=_hard_result["filled_price"], amount=_hard_rec_amount,
+                        status=_hard_result["status"],
+                    ))
+                    # 텔레그램 강제 청산 알림
+                    notifier.send_message(
+                        f"🔔 <b>[QuantFlow] {_hard_trigger}</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                        f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                        f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                        f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                        f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
 
             # 5. 🎯 ML/Rule-based 스나이퍼 추론 및 확신도 필터링
             if hasattr(_predictor, "predict_with_confidence"):
@@ -1126,4 +1269,381 @@ def daily_report_task():
     except Exception as exc:
         logger.error(f"❌ [일간 결산] 리포트 생성 중 예외 발생: {exc}", exc_info=True)
         # 리포트 실패가 전체 워커를 죽이지 않도록 안전하게 에러 상태만 반환
+        return {"status": "report_failed", "error": str(exc)}
+
+
+# ─────────────────────────────────────────────
+# 📥 [8차 확장] 텔레그램 실시간 /status 명령어 및 일일 결산 스케줄러
+# ─────────────────────────────────────────────
+
+def _send_status_brief():
+    """
+    📊 실시간 시스템 관제 요약 브리핑을 조립하여 텔레그램으로 전송합니다.
+    """
+    try:
+        exchange = get_exchange()
+        balance_info = _fetch_balance_with_retry(exchange)
+        usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
+        btc_balance = Decimal(str(balance_info["total"].get("BTC", 0.0)))
+        
+        symbol = "BTC/USDT"
+        
+        for session in _get_sync_session():
+            latest = session.query(MarketData).filter(
+                MarketData.symbol == symbol
+            ).order_by(desc(MarketData.timestamp)).first()
+            
+            if not latest:
+                notifier.send_message("📊 <b>[QuantFlow 관제 브리핑]</b>\n시스템에 시장 데이터가 존재하지 않습니다.")
+                return
+            
+            current_close = Decimal(str(latest.close))
+            rsi_val = float(latest.rsi_14) if latest.rsi_14 is not None else 0.0
+            bb_upper_val = float(latest.bb_upper) if latest.bb_upper is not None else 0.0
+            bb_lower_val = float(latest.bb_lower) if latest.bb_lower is not None else 0.0
+            sma_val = float(latest.sma_20) if latest.sma_20 is not None else 0.0
+            
+            # 총 자산 가치 = USDT 잔고 + BTC 잔고 * 현재가
+            total_assets = usdt_balance + (btc_balance * current_close)
+            
+            # 포지션 분석
+            last_trade = session.query(TradeHistory).filter(
+                TradeHistory.symbol == symbol, TradeHistory.status == "FILLED"
+            ).order_by(desc(TradeHistory.timestamp)).first()
+            
+            current_position = "FLAT"
+            entry_price = None
+            pos_pnl_str = ""
+            pos_duration_str = ""
+            
+            if last_trade and last_trade.side == "BUY":
+                current_position = "LONG"
+                entry_price = Decimal(str(last_trade.price))
+                pos_return = (current_close - entry_price) / entry_price * 100
+                pos_pnl_str = f" ({pos_return:+.2f}%)"
+                
+                # 진입 시간 경과
+                entry_ts = last_trade.timestamp
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                else:
+                    entry_ts = entry_ts.astimezone(timezone.utc)
+                minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
+                pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+
+            # 최근 24시간 실현 손익 집계
+            cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+            trades_24h = (
+                session.query(TradeHistory)
+                .filter(TradeHistory.timestamp >= cutoff, TradeHistory.status == "FILLED")
+                .all()
+            )
+            
+            total_buy_val = Decimal("0")
+            total_sell_val = Decimal("0")
+            for t in trades_24h:
+                if t.price is None or t.amount is None:
+                    continue
+                val = Decimal(str(t.price)) * Decimal(str(t.amount))
+                if t.side == "BUY":
+                    total_buy_val += val
+                elif t.side == "SELL":
+                    total_sell_val += val
+            realized_pnl_24h = total_sell_val - total_buy_val
+            pnl_24h_str = f"{realized_pnl_24h:+,.2f} USDT"
+            
+            # 포지션 이모지
+            pos_emoji = "🟢 LONG" if current_position == "LONG" else "⚪ FLAT"
+            
+            # KST 시간 표기
+            kst_tz = timezone(timedelta(hours=9))
+            now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
+            
+            brief_lines = [
+                "📊 <b>[QuantFlow 실시간 관제 브리핑]</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"• 🤖 <b>엔진 상태:</b> <code>RUNNING</code>",
+                f"• ⏰ <b>관제 시각:</b> <code>{now_kst}</code>",
+                "",
+                "📦 <b>현재 유지 포지션</b>",
+                "────────────────────",
+                f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
+                f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
+                f"• <b>경과 시간:</b> <code>{pos_duration_str or '-'}</code>" if entry_price else "• <b>경과 시간:</b> <code>-</code>",
+                "",
+                "💰 <b>실시간 자산 잔고</b>",
+                "────────────────────",
+                f"• <b>가용 USDT:</b> <code>${float(usdt_balance):,.2f} USDT</code>",
+                f"• <b>보유 BTC:</b> <code>{float(btc_balance):.6f} BTC</code>",
+                f"• <b>총 자산 가치:</b> <code>${float(total_assets):,.2f} USDT</code>",
+                f"• <b>24H 실현 손익:</b> <code>{pnl_24h_str}</code>",
+                "",
+                "📈 <b>실시간 시장 지표</b>",
+                "────────────────────",
+                f"• <b>현재가 (Close):</b> <code>${float(current_close):,.2f}</code>",
+                f"• <b>RSI (14주기):</b> <code>{rsi_val:.2f}</code>",
+                f"• <b>볼린저 밴드 상단:</b> <code>${bb_upper_val:,.2f}</code>",
+                f"• <b>볼린저 밴드 하단:</b> <code>${bb_lower_val:,.2f}</code>",
+                f"• <b>SMA (20주기):</b> <code>${sma_val:,.2f}</code>",
+                "━━━━━━━━━━━━━━━━━━━━"
+            ]
+            
+            notifier.send_message("\n".join(brief_lines))
+            logger.info("✅ 텔레그램 '/status' 브리핑 발송 완료")
+    except Exception as e:
+        logger.error(f"❌ _send_status_brief() 중 에러 발생: {e}", exc_info=True)
+        notifier.send_message(f"❌ <b>[QuantFlow 오류]</b>\n실시간 상태 브리핑 작성 중 실패했습니다: <code>{str(e)}</code>")
+
+
+@celery_app.task(name="worker.tasks.telegram_command_listener_task", queue="default")
+def telegram_command_listener_task():
+    """
+    📥 텔레그램 명령어 수신기 — 30초마다 Celery Beat에 의해 가동.
+    Telegram getUpdates API를 폴링하여 '/status' 명령어를 감지하고 실시간 상태를 브로드캐스팅합니다.
+    """
+    if not notifier.is_enabled:
+        logger.debug("Telegram notifier is disabled. Skipping command listener.")
+        return {"status": "notifier_disabled"}
+
+    import redis
+    import httpx
+    
+    r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    
+    last_update_id_key = "quantflow:telegram:last_update_id"
+    last_update_id = r.get(last_update_id_key)
+    
+    url = f"https://api.telegram.org/bot{notifier.bot_token}/getUpdates"
+    params = {}
+    if last_update_id:
+        params["offset"] = int(last_update_id) + 1
+    params["timeout"] = 5  # short polling timeout in seconds
+    
+    try:
+        with httpx.Client() as client:
+            response = client.get(url, params=params, timeout=10.0)
+            if response.status_code != 200:
+                logger.warning(f"Telegram getUpdates failed: HTTP {response.status_code}")
+                return {"status": f"failed_http_{response.status_code}"}
+            
+            data = response.json()
+            updates = data.get("result", [])
+            if not updates:
+                return {"status": "no_new_updates"}
+            
+            max_update_id = last_update_id
+            for update in updates:
+                update_id = update.get("update_id")
+                if last_update_id and update_id <= int(last_update_id):
+                    continue
+                max_update_id = max(max_update_id or 0, update_id)
+                
+                message = update.get("message")
+                if not message:
+                    continue
+                
+                chat = message.get("chat", {})
+                chat_id = str(chat.get("id"))
+                
+                # chat_id 보안 가드: 설정된 chat_id와 일치하는 경우에만 명령을 처리
+                if chat_id != str(notifier.chat_id):
+                    logger.warning(f"Unauthorized chat_id attempt: {chat_id}")
+                    continue
+                
+                text = message.get("text", "").strip()
+                if text == "/status":
+                    logger.info("🎯 텔레그램 '/status' 원격 명령어 수신 성공! 실시간 브리핑 작성 및 송신")
+                    _send_status_brief()
+            
+            if max_update_id:
+                r.set(last_update_id_key, max_update_id)
+                
+            return {"status": "processed", "processed_count": len(updates)}
+    except Exception as exc:
+        logger.error(f"❌ 텔레그램 getUpdates 조회 중 예외 발생: {exc}", exc_info=True)
+        return {"status": "error", "message": str(exc)}
+
+
+@celery_app.task(name="worker.tasks.generate_daily_report_task", queue="default")
+def generate_daily_report_task():
+    """
+    📊 QuantFlow 프리미엄 일일결산 리포트 스케줄러.
+    매일 23:59 KST에 1회 호출되어 오늘 하루의 실현 손익, 자산 총액, 승률 등을 금융기관 수준으로 리포팅합니다.
+    """
+    logger.info("📊 [일간 결산] generate_daily_report_task 가동")
+    
+    try:
+        kst_tz = timezone(timedelta(hours=9))
+        now_kst = datetime.now(kst_tz)
+        
+        # 오늘 KST 00:00:00 계산 후 UTC로 변환하여 DB 조회
+        start_of_day_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_of_day_utc = start_of_day_kst.astimezone(timezone.utc)
+        
+        # 실시간 자산 및 시세 조회
+        exchange = get_exchange()
+        balance_info = _fetch_balance_with_retry(exchange)
+        usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
+        btc_balance = Decimal(str(balance_info["total"].get("BTC", 0.0)))
+        
+        symbol = "BTC/USDT"
+        
+        for session in _get_sync_session():
+            latest = session.query(MarketData).filter(
+                MarketData.symbol == symbol
+            ).order_by(desc(MarketData.timestamp)).first()
+            
+            current_close = Decimal(str(latest.close)) if latest else Decimal("0")
+            total_assets = usdt_balance + (btc_balance * current_close)
+            
+            # 오늘 KST 00:00 이후 체결된 주문 스캔
+            today_trades = (
+                session.query(TradeHistory)
+                .filter(TradeHistory.timestamp >= start_of_day_utc)
+                .order_by(TradeHistory.timestamp)
+                .all()
+            )
+            
+            # 오늘 체결 완료된 SELL 주문
+            today_filled_sells = [
+                t for t in today_trades
+                if t.side == "SELL" and t.status == "FILLED" and t.price is not None
+            ]
+            
+            # 매수 평단가 산출을 위해 symbol의 전체 BUY 이력 로드
+            all_filled_buys = (
+                session.query(TradeHistory)
+                .filter(TradeHistory.symbol == symbol, TradeHistory.side == "BUY", TradeHistory.status == "FILLED")
+                .order_by(TradeHistory.timestamp)
+                .all()
+            )
+            
+            # PnL 및 승률 계산 (Round-trip 매수 평단가 기준)
+            realized_pnl = Decimal("0")
+            win_count = 0
+            loss_count = 0
+            
+            for sell_trade in today_filled_sells:
+                prior_buys = [b for b in all_filled_buys if b.timestamp <= sell_trade.timestamp]
+                if not prior_buys:
+                    continue
+                
+                sum_cost = Decimal("0")
+                sum_qty = Decimal("0")
+                for b in prior_buys:
+                    sum_cost += Decimal(str(b.price)) * Decimal(str(b.amount))
+                    sum_qty += Decimal(str(b.amount))
+                
+                if sum_qty == Decimal("0"):
+                    continue
+                
+                avg_buy_price = sum_cost / sum_qty
+                sell_price = Decimal(str(sell_trade.price))
+                sell_qty = Decimal(str(sell_trade.amount))
+                
+                trade_pnl = (sell_price - avg_buy_price) * sell_qty
+                realized_pnl += trade_pnl
+                
+                if sell_price > avg_buy_price:
+                    win_count += 1
+                else:
+                    loss_count += 1
+            
+            # 현재 포지션 정보
+            last_trade = session.query(TradeHistory).filter(
+                TradeHistory.symbol == symbol, TradeHistory.status == "FILLED"
+            ).order_by(desc(TradeHistory.timestamp)).first()
+            
+            current_position = "FLAT"
+            entry_price = None
+            pos_pnl_str = ""
+            pos_duration_str = ""
+            
+            if last_trade and last_trade.side == "BUY":
+                current_position = "LONG"
+                entry_price = Decimal(str(last_trade.price))
+                pos_return = (current_close - entry_price) / entry_price * 100
+                pos_pnl_str = f" ({pos_return:+.2f}%)"
+                
+                # 진입 시간 경과
+                entry_ts = last_trade.timestamp
+                if entry_ts.tzinfo is None:
+                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                else:
+                    entry_ts = entry_ts.astimezone(timezone.utc)
+                minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
+                pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+                
+            pos_emoji = "🟢 LONG" if current_position == "LONG" else "⚪ FLAT"
+            
+            # 오늘 하루의 주문 시도 수 집계
+            total_count = len(today_trades)
+            filled_count = sum(1 for t in today_trades if t.status == "FILLED")
+            rejected_count = sum(1 for t in today_trades if t.status == "REJECTED")
+            failed_count = sum(1 for t in today_trades if t.status == "FAILED")
+            
+            fill_rate_str = f"{(filled_count / total_count * 100):.1f}%" if total_count > 0 else "N/A"
+            
+            evaluated_total = win_count + loss_count
+            win_rate_str = f"{(win_count / evaluated_total * 100):.1f}%" if evaluated_total > 0 else "N/A"
+            
+            if realized_pnl > Decimal("0"):
+                pnl_emoji = "📈"
+                pnl_sign = "+"
+            elif realized_pnl < Decimal("0"):
+                pnl_emoji = "📉"
+                pnl_sign = ""
+            else:
+                pnl_emoji = "➖"
+                pnl_sign = ""
+                
+            report_time_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
+            
+            report_lines = [
+                "📊 <b>[QuantFlow 일일 결산 리포트]</b>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"• <b>집계 일자:</b> <code>{now_kst.strftime('%Y-%m-%d')} (KST)</code>",
+                "",
+                "💰 <b>실시간 자산 총액</b>",
+                "────────────────────",
+                f"• <b>가용 USDT:</b> <code>${float(usdt_balance):,.2f} USDT</code>",
+                f"• <b>보유 BTC:</b> <code>{float(btc_balance):.6f} BTC</code>",
+                f"• <b>총 자산 가치:</b> <code>${float(total_assets):,.2f} USDT</code>",
+                "",
+                "📦 <b>유지 포지션 현황</b>",
+                "────────────────────",
+                f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
+                f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
+                f"• <b>경과 시간:</b> <code>{pos_duration_str or '-'}</code>" if entry_price else "• <b>경과 시간:</b> <code>-</code>",
+                "",
+                "📋 <b>오늘 하루 매매 요약</b>",
+                "────────────────────",
+                f"• <b>총 주문 시도:</b> <code>{total_count}건</code>",
+                f"• <b>체결 완료(FILLED):</b> <code>{filled_count}건</code>",
+                f"• <b>거부(REJECTED):</b> <code>{rejected_count}건</code>",
+                f"• <b>실패(FAILED):</b> <code>{failed_count}건</code>",
+                f"• <b>체결 성공률:</b> <code>{fill_rate_str}</code>",
+                "",
+                "🎯 <b>실현 손익 및 승률</b>",
+                "────────────────────",
+                f"• {pnl_emoji} <b>금일 실현 손익:</b> <code>{pnl_sign}{realized_pnl:,.2f} USDT</code>",
+                f"• <b>익절(Win):</b> <code>{win_count}건</code> / <b>손절(Loss):</b> <code>{loss_count}건</code>",
+                f"• <b>승률:</b> <code>{win_rate_str}</code>",
+                "━━━━━━━━━━━━━━━━━━━━",
+                f"• <b>리포트 생성:</b> <code>{report_time_kst}</code>",
+            ]
+            
+            notifier.send_message("\n".join(report_lines))
+            logger.info(f"📊 [generate_daily_report_task] 리포트 전송 완료 — PnL: {pnl_sign}{realized_pnl:,.2f} USDT")
+            
+            return {
+                "status": "report_sent",
+                "total_trades": total_count,
+                "filled_trades": filled_count,
+                "realized_pnl": str(realized_pnl),
+                "win_rate": win_rate_str,
+            }
+            
+    except Exception as exc:
+        logger.error(f"❌ [generate_daily_report_task] 리포트 생성 중 예외 발생: {exc}", exc_info=True)
         return {"status": "report_failed", "error": str(exc)}

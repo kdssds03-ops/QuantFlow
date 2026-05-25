@@ -41,6 +41,8 @@ celery_app.conf.update(
         "worker.tasks.analyze_and_trade":     {"queue": "trading"},
         "worker.tasks.check_time_sync_task":  {"queue": "default"},
         "worker.tasks.daily_report_task":     {"queue": "default"},
+        "worker.tasks.generate_daily_report_task": {"queue": "default"},
+        "worker.tasks.telegram_command_listener_task": {"queue": "default"},
     },
 )
 
@@ -80,10 +82,17 @@ celery_app.conf.beat_schedule = {
         "options": {"queue": "default"},
     },
 
-    # ── 매일 자정(Asia/Seoul) 일간 리포트 ────────
-    "daily-report-midnight": {
-        "task": "worker.tasks.daily_report_task",
-        "schedule": crontab(hour=0, minute=0),
+    # ── 매일 23:59(Asia/Seoul) 일간 결산 리포트 ────────
+    "daily-report-2359": {
+        "task": "worker.tasks.generate_daily_report_task",
+        "schedule": crontab(hour=23, minute=59),
+        "options": {"queue": "default"},
+    },
+
+    # ── 30초마다 텔레그램 명령어 수신 ────────
+    "telegram-command-listener": {
+        "task": "worker.tasks.telegram_command_listener_task",
+        "schedule": 30.0,
         "options": {"queue": "default"},
     },
 }

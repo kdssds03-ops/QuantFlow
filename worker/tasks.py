@@ -880,29 +880,30 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
             current_close = Decimal(str(latest.close))
 
-            # 3. 가장 최근 체결 주문 기반 실시간 포지션(롱/플랫) 상태 분석
+            # 3. 가장 최근 체결 주문 기반 실시간 숏 포지션(SHORT/FLAT) 상태 분석
             last_trade = session.query(TradeHistory).filter(TradeHistory.symbol == symbol, TradeHistory.status == "FILLED").order_by(desc(TradeHistory.timestamp)).first()
             
             current_position = "FLAT"
             entry_price = None
-            if last_trade and last_trade.side == "BUY":
-                current_position = "LONG"
+            if last_trade and last_trade.side == "SELL":
+                current_position = "SHORT"
                 entry_price = Decimal(str(last_trade.price))
 
             # 4. 🛡️ [손절 방패 (우선순위 1위)] 리스크 관리 작동 검사
-            if current_position == "LONG" and entry_price:
-                price_return = (current_close - entry_price) / entry_price
+            if current_position == "SHORT" and entry_price:
+                # 숏 포지션 수익률: 가격이 하락해야 수익 (+)
+                price_return = (entry_price - current_close) / entry_price
                 if price_return <= STOP_LOSS_THRESHOLD:
                     logger.warning(f"🚨 [손절 방패 가동] 평단가: {entry_price} -> 현재가: {current_close} ({price_return*100:.2f}%)")
                     
-                    # [동적 수량 계산 - 손절 청산]: BTC 가용 잔고 전량 청산
-                    calculated_amount = btc_free
+                    # [동적 수량 계산 - 손절 청산]: 숏 진입 시 수량만큼 환매수(BUY)
+                    calculated_amount = Decimal(str(last_trade.amount))
                     
                     # 방어적 검증 (Short-circuit): 최소 주문 수량 미만 검사
                     if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
                         logger.warning(
                             f"⏸️  [손절 방패] 계산된 청산 수량이 부족하여 주문 생략: "
-                            f"BTC 잔고={calculated_amount}, 최소 필요={MIN_ORDER_BTC}"
+                            f"계산된 수량={calculated_amount}, 최소 필요={MIN_ORDER_BTC}"
                         )
                         return {"status": "insufficient_calculated_amount"}
 
@@ -910,7 +911,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     sl_result: OrderResult = _execute_order_pipeline(
                         exchange=exchange,
                         symbol=symbol,
-                        side="SELL",
+                        side="BUY",  # 숏 포지션 청산은 BUY
                         amount=calculated_amount,
                         trigger_type="STOP_LOSS_SHIELD",
                         fallback_price=current_close,
@@ -933,13 +934,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
                     return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
 
-            # 4-1. ⏱️ [8차 확장] 하드 TP / 하드 SL / 타임아웃 안전장치 (우선순위 2위)
+            # 4-1. ⏱️ [8차/9.1.0 확장] 하드 TP / 하드 SL / 타임아웃 안전장치 (우선순위 2위)
             # ─────────────────────────────────────────────────────────────────────
             # 지표 신호와 무관하게, 포지션이 극단적 수익/손실에 도달하거나
             # 최대 보유 시간을 초과하면 무조건 강제 청산합니다.
-            # 기존 STOP_LOSS_SHIELD(-1.0%)보다 더 깊은 구간에서 발동하는 하드 안전망입니다.
-            if current_position == "LONG" and entry_price and last_trade:
-                price_return = (current_close - entry_price) / entry_price
+            if current_position == "SHORT" and entry_price and last_trade:
+                # 숏 포지션 수익률 (진입가 - 현재가) / 진입가
+                price_return = (entry_price - current_close) / entry_price
                 now_utc_check = datetime.now(timezone.utc)
 
                 # 진입 시각 타임존 정규화
@@ -958,25 +959,25 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     _hard_reason  = f"보유 {minutes_held:.0f}분 → 최대 {MAX_POSITION_MINUTES}분 초과"
                 elif price_return >= HARD_TP_THRESHOLD:
                     _hard_trigger = "HARD_TP_EXIT"
-                    _hard_reason  = f"수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
+                    _hard_reason  = f"숏 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
                 elif price_return <= HARD_SL_THRESHOLD:
                     _hard_trigger = "HARD_SL_EXIT"
-                    _hard_reason  = f"수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
+                    _hard_reason  = f"숏 수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
 
                 if _hard_trigger:
                     logger.warning(
-                        "🔔 [%s] 강제 청산 발동: %s (평단=$%s, 현재=$%s)",
+                        "🔔 [%s] 숏 강제 청산 발동: %s (평단=$%s, 현재=$%s)",
                         _hard_trigger, _hard_reason, entry_price, current_close,
                     )
-                    _hard_amount = btc_free
+                    _hard_amount = Decimal(str(last_trade.amount))
                     if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
-                        logger.warning("[%s] BTC 잔고 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
-                        return {"status": "insufficient_btc_for_hard_exit"}
+                        logger.warning("[%s] 숏 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
+                        return {"status": "insufficient_amount_for_hard_exit"}
 
                     _hard_result: OrderResult = _execute_order_pipeline(
                         exchange=exchange,
                         symbol=symbol,
-                        side="SELL",
+                        side="BUY",  # 숏 청산
                         amount=_hard_amount,
                         trigger_type=_hard_trigger,
                         fallback_price=current_close,
@@ -989,13 +990,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         else _hard_amount
                     )
                     session.add(TradeHistory(
-                        timestamp=datetime.now(timezone.utc), symbol=symbol, side="SELL",
+                        timestamp=datetime.now(timezone.utc), symbol=symbol, side="BUY",
                         price=_hard_result["filled_price"], amount=_hard_rec_amount,
                         status=_hard_result["status"],
                     ))
                     # 텔레그램 강제 청산 알림
                     notifier.send_message(
-                        f"🔔 <b>[QuantFlow] {_hard_trigger}</b>\n"
+                        f"🔔 <b>[QuantFlow] {_hard_trigger} (Short Cover)</b>\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
                         f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
@@ -1006,15 +1007,26 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     )
                     return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
 
-            # 5. 🎯 ML/Rule-based 스나이퍼 추론 및 확신도 필터링
-            if hasattr(_predictor, "predict_with_confidence"):
-                action, confidence = _predictor.predict_with_confidence(latest)
+            # 5. 🎯 [v9.1.0] 하드코딩된 숏(Short) 매매 판단 (Predictor 오버라이드)
+            current_rsi = Decimal(str(latest.rsi_14)) if latest.rsi_14 is not None else Decimal("50")
+            current_bb_upper = Decimal(str(latest.bb_upper)) if latest.bb_upper is not None else Decimal("0")
+            current_bb_lower = Decimal(str(latest.bb_lower)) if latest.bb_lower is not None else Decimal("0")
+            
+            action = "HOLD"
+            confidence = 1.0
+            
+            if current_position == "SHORT":
+                # 청산 버퍼 확장: bb_lower 터치 혹은 rsi <= 35
+                if current_close <= current_bb_lower or current_rsi <= Decimal("35"):
+                    logger.info(f"🎯 [v9.1.0] 숏 청산 시그널 발생! Close({current_close}) <= BB_Lower({current_bb_lower}) OR RSI({current_rsi}) <= 35")
+                    action = "BUY"  # 숏 청산(환매수)
             else:
-                # 레거시 폴백 대응용 구조
-                action = _predictor.predict(latest)
-                confidence = CONFIDENCE_THRESHOLD if action != "HOLD" else 0.0
+                # 진입 타점 강화: bb_upper 돌파 + rsi >= 73
+                if current_close > current_bb_upper and current_rsi >= Decimal("73"):
+                    logger.info(f"🎯 [v9.1.0] 숏 진입 시그널 발생! Close({current_close}) > BB_Upper({current_bb_upper}) AND RSI({current_rsi}) >= 73")
+                    action = "SELL" # 숏 진입
 
-            if action == "HOLD" or confidence < CONFIDENCE_THRESHOLD:
+            if action == "HOLD":
                 return {"status": "hold_or_low_confidence", "confidence": confidence}
 
             # 6. ⏳ 멱등성 보장을 위한 5분 쿨다운 검사
@@ -1027,21 +1039,21 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 logger.warning(f"⏳ 쿨다운 필터 발동: {action} 주문 생성 스킵")
                 return {"status": "cooldown_skipped"}
 
-            # 7. ⚡ 주문 분기점 정의 (신규 진입 vs 역시그널 청산) 및 동적 주문 수량 계산
-            trigger_type = "SNIPER_ENTRY"
-            if current_position == "LONG" and action == "SELL":
-                trigger_type = "REVERSE_SWITCH_EXIT"  # '창과 방패'의 익절 조화
+            # 7. ⚡ 주문 분기점 정의 (신규 숏 진입 vs 숏 청산) 및 동적 주문 수량 계산
+            trigger_type = "SNIPER_SHORT_ENTRY"
+            if current_position == "SHORT" and action == "BUY":
+                trigger_type = "REVERSE_SWITCH_EXIT_SHORT"
 
-            # 동적 주문 수량 연산 (USDT 10% vs BTC 100%)
-            if action == "BUY":
-                # 가용 USDT의 10%만큼 매수 수량 계산
+            # 동적 주문 수량 연산 (USDT 10% 숏 진입 vs 진입수량 환매수 청산)
+            if action == "SELL":
+                # 가용 USDT의 10%만큼 숏 진입 수량 계산
                 target_usdt = usdt_free * Decimal("0.1")
                 calculated_amount = target_usdt / current_close
-                logger.info(f"💰 [자산 배분 - BUY] 가용 USDT: {usdt_free} -> 진입 목표: {target_usdt} USDT -> 계산 수량: {calculated_amount} BTC")
-            elif action == "SELL":
-                # 가용 BTC 전량 청산
-                calculated_amount = btc_free
-                logger.info(f"💰 [자산 배분 - SELL] 가용 BTC 전량 청산: {calculated_amount} BTC")
+                logger.info(f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표: {target_usdt} USDT -> 계산 수량: {calculated_amount} BTC")
+            elif action == "BUY":
+                # 숏 청산 시 진입했던 수량만큼 환매수
+                calculated_amount = Decimal(str(last_trade.amount)) if last_trade else Decimal("0")
+                logger.info(f"💰 [자산 배분 - 숏 청산] 보유 숏 전량 청산: {calculated_amount} BTC")
             else:
                 calculated_amount = Decimal("0")
 
@@ -1282,6 +1294,10 @@ def _send_status_brief():
     """
     try:
         exchange = get_exchange()
+        # [모의투자 모드 동기화]
+        if getattr(settings, "BINANCE_SANDBOX_MODE", False):
+            exchange.set_sandbox_mode(True)
+            
         balance_info = _fetch_balance_with_retry(exchange)
         usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
         btc_balance = Decimal(str(balance_info["total"].get("BTC", 0.0)))
@@ -1316,20 +1332,57 @@ def _send_status_brief():
             pos_pnl_str = ""
             pos_duration_str = ""
             
-            if last_trade and last_trade.side == "BUY":
-                current_position = "LONG"
-                entry_price = Decimal(str(last_trade.price))
-                pos_return = (current_close - entry_price) / entry_price * 100
+            # CCXT 실시간 포지션 조회 시도 (선물 계좌의 실제 상태 우선)
+            ccxt_pos = None
+            try:
+                if exchange.has.get('fetchPositions'):
+                    positions = exchange.fetch_positions([symbol])
+                    for p in positions:
+                        if p.get('contracts') and float(p['contracts']) > 0:
+                            ccxt_pos = p
+                            break
+            except Exception as e:
+                logger.warning(f"⚠️ CCXT 포지션 조회 실패 (Fallback to DB): {e}")
+
+            if ccxt_pos:
+                # CCXT 기준 포지션 파싱
+                side_str = ccxt_pos.get('side', '').lower()
+                current_position = "SHORT" if side_str == 'short' else "LONG"
+                entry_price = Decimal(str(ccxt_pos.get('entryPrice', 0)))
+                pos_amount = Decimal(str(ccxt_pos.get('contracts', 0)))
+                
+                # 수익률 계산 (숏 기준: 진입가 - 현재가, 롱 기준: 현재가 - 진입가)
+                if current_position == "SHORT":
+                    pos_return = (entry_price - current_close) / entry_price * 100
+                else:
+                    pos_return = (current_close - entry_price) / entry_price * 100
                 pos_pnl_str = f" ({pos_return:+.2f}%)"
                 
-                # 진입 시간 경과
-                entry_ts = last_trade.timestamp
-                if entry_ts.tzinfo is None:
-                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
-                else:
-                    entry_ts = entry_ts.astimezone(timezone.utc)
-                minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+                # 진입 시간 경과 (DB의 마지막 거래 이력 참조)
+                pos_duration_str = ""
+                if last_trade:
+                    entry_ts = last_trade.timestamp
+                    if entry_ts.tzinfo is None:
+                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                    else:
+                        entry_ts = entry_ts.astimezone(timezone.utc)
+                    minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
+                    pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+            else:
+                # Fallback: DB 기준 로직 (v9.1.0 숏 진입 기준)
+                if last_trade and last_trade.side == "SELL":
+                    current_position = "SHORT"
+                    entry_price = Decimal(str(last_trade.price))
+                    pos_return = (entry_price - current_close) / entry_price * 100
+                    pos_pnl_str = f" ({pos_return:+.2f}%)"
+                    
+                    entry_ts = last_trade.timestamp
+                    if entry_ts.tzinfo is None:
+                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                    else:
+                        entry_ts = entry_ts.astimezone(timezone.utc)
+                    minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
+                    pos_duration_str = f" ({minutes_held:.0f}분 보유)"
 
             # 최근 24시간 실현 손익 집계
             cutoff = datetime.now(timezone.utc) - timedelta(days=1)
@@ -1353,7 +1406,12 @@ def _send_status_brief():
             pnl_24h_str = f"{realized_pnl_24h:+,.2f} USDT"
             
             # 포지션 이모지
-            pos_emoji = "🟢 LONG" if current_position == "LONG" else "⚪ FLAT"
+            if current_position == "SHORT":
+                pos_emoji = "🔴 SHORT"
+            elif current_position == "LONG":
+                pos_emoji = "🟢 LONG"
+            else:
+                pos_emoji = "⚪ FLAT"
             
             # KST 시간 표기
             kst_tz = timezone(timedelta(hours=9))
@@ -1393,6 +1451,49 @@ def _send_status_brief():
     except Exception as e:
         logger.error(f"❌ _send_status_brief() 중 에러 발생: {e}", exc_info=True)
         notifier.send_message(f"❌ <b>[QuantFlow 오류]</b>\n실시간 상태 브리핑 작성 중 실패했습니다: <code>{str(e)}</code>")
+
+import unicodedata
+import requests
+
+def handle_telegram_command(command: str) -> str:
+    """
+    텔레그램 챗봇으로부터 수신된 명령어를 처리하고 Redis 상태를 제어하며,
+    비동기 세션 데드락 방지를 위해 독립적인 HTTP 소켓(requests)으로 응답을 즉시 선제 발송합니다.
+    """
+    import redis
+    r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    status_key = "quantflow:sys_status"
+    
+    # 2. 정돈 처리 강화: 전각 문자를 반각으로 변환(NFKC), 공백 제거, 소문자화하여 대소문자 혼용 및 특수문자 방어
+    normalized_cmd = unicodedata.normalize('NFKC', command).strip().lower()
+    
+    token = getattr(settings, "telegram_bot_token", getattr(settings, "TELEGRAM_BOT_TOKEN", None))
+    chat_id = getattr(settings, "telegram_chat_id", getattr(settings, "TELEGRAM_CHAT_ID", None))
+    
+    def _send_reply(text: str):
+        if token and chat_id:
+            try:
+                url = f"https://api.telegram.org/bot{token}/sendMessage"
+                payload = {"chat_id": chat_id, "text": text}
+                response = requests.post(url, json=payload, timeout=5)
+                response.raise_for_status()
+            except Exception as e:
+                logger.error(f"❌ 텔레그램 응답 독립 소켓 통신 중 치명적 예외 발생 (시스템 다운 방어): {e}")
+
+    # 1. 조건문 유연화: 'in' 연산자로 변경하여 이모지 섞임이나 포맷 변형 방어
+    if "/pause" in normalized_cmd:
+        r.set(status_key, "PAUSED")
+        logger.warning("🛑 [원격 제어] 시스템이 사용자에 의해 일시 정지(PAUSED) 상태로 전환되었습니다.")
+        _send_reply("⏸️ [QuantFlow] 시스템이 일시 정지되었습니다. 모든 자동 매매 분석 및 진입이 동결됩니다.")
+        return "PAUSED"
+
+    elif "/resume" in normalized_cmd:
+        r.set(status_key, "RUNNING")
+        logger.info("▶️ [원격 제어] 시스템이 사용자에 의해 재개(RUNNING) 상태로 전환되었습니다.")
+        _send_reply("▶️ [QuantFlow] 시스템이 재개되었습니다. AI 하이브리드 사냥을 다시 집행합니다.")
+        return "RUNNING"
+
+    return "UNKNOWN_COMMAND"
 
 
 @celery_app.task(name="worker.tasks.telegram_command_listener_task", queue="default")
@@ -1436,7 +1537,14 @@ def telegram_command_listener_task():
                 update_id = update.get("update_id")
                 if last_update_id and update_id <= int(last_update_id):
                     continue
-                max_update_id = max(max_update_id or 0, update_id)
+                try:
+                    safe_max_id = int(max_update_id) if max_update_id is not None else 0
+                    safe_update_id = int(update_id)
+                    max_update_id = max(safe_max_id, safe_update_id)
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"텔레그램 update_id 형변환 실패: max_update_id={max_update_id}, update_id={update_id}, error={e}")
+                    # 파싱 실패시 현재 처리한 update_id라도 (문자열로) 캐싱하여 무한 루프를 방지합니다.
+                    max_update_id = str(update_id) if update_id is not None else max_update_id
                 
                 message = update.get("message")
                 if not message:
@@ -1454,6 +1562,11 @@ def telegram_command_listener_task():
                 if text == "/status":
                     logger.info("🎯 텔레그램 '/status' 원격 명령어 수신 성공! 실시간 브리핑 작성 및 송신")
                     _send_status_brief()
+                else:
+                    # 유연한 명령어 훅 (이모지 및 변형 텍스트 대응)
+                    res = handle_telegram_command(text)
+                    if res != "UNKNOWN_COMMAND":
+                        logger.info(f"✅ 원격 제어 명령어 처리 완료: {res}")
             
             if max_update_id:
                 r.set(last_update_id_key, max_update_id)

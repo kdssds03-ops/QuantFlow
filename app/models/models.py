@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     DateTime,
     Numeric,
+    Float,
     Enum as SAEnum,
     UniqueConstraint,
     Index,
@@ -64,6 +65,11 @@ class MarketData(Base):
     rsi_14   = Column(Numeric(precision=18, scale=8), nullable=True)   # 14주기 RSI
     bb_upper = Column(Numeric(precision=18, scale=8), nullable=True)   # 볼린저밴드 상단
     bb_lower = Column(Numeric(precision=18, scale=8), nullable=True)   # 볼린저밴드 하단
+
+    atr_14      = Column(Float, nullable=True)  # 14주기 ATR
+    macd_line   = Column(Float, nullable=True)  # MACD 라인
+    macd_signal = Column(Float, nullable=True)  # MACD 시그널
+    macd_hist   = Column(Float, nullable=True)  # MACD 히스토그램
 
     # ── 제약 조건 ────────────────────────────────────────────────────────
     # (timestamp, symbol) 쌍은 유일 → 동일 캔들 중복 삽입 방지

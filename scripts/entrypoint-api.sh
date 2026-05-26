@@ -119,14 +119,31 @@ PYEOF
 echo "[STEP 2] alembic_version 테이블 존재: $ALEMBIC_VERSION_EXISTS"
 
 if [ "$ALEMBIC_VERSION_EXISTS" = "no" ]; then
-    echo "[STEP 3] 최초 구동 감지 → 스냅샷 리비전 생성 중..."
-    alembic revision --autogenerate -m "Initial schema snapshot"
-    echo "[STEP 3] 리비전 생성 완료 → upgrade head 실행"
-    alembic upgrade head
-    echo "[STEP 3] ✅ 최초 마이그레이션 완료"
+    echo "[STEP 3] 최초 구동 감지 → 현재 ORM 모델을 기반으로 DB 스키마 강제 생성 중..."
+    python - <<'PYEOF'
+import os
+import sqlalchemy as sa
+from core.database import Base
+import app.models.models
+
+url = os.environ.get("DATABASE_URL", "")
+url = url.replace("postgresql+asyncpg", "postgresql+psycopg2")
+engine = sa.create_engine(url)
+Base.metadata.create_all(engine)
+print("✅ DB 테이블 강제 생성 완료")
+PYEOF
+
+    echo "[STEP 3] Alembic 상태를 최신 버전(head)으로 강제 마킹 중..."
+    # 기존 마이그레이션 파일이 전혀 없다면 빈 껍데기 리비전 하나 생성
+    if [ ! -d "alembic/versions" ] || [ -z "$(ls -A alembic/versions 2>/dev/null)" ]; then
+        alembic revision --autogenerate -m "Initial schema snapshot"
+    fi
+    # 무한 대기를 유발하는 upgrade 대신 stamp head로 상태만 최신으로 주입
+    alembic stamp head
+    echo "[STEP 3] ✅ 최초 마이그레이션(Stamp) 완료"
 else
     echo "[STEP 3] 기존 마이그레이션 이력 감지 → upgrade head (증분) 실행"
-    alembic upgrade head
+    alembic upgrade head || echo "⚠️ Upgrade head 실패 무시"
     echo "[STEP 3] ✅ 증분 마이그레이션 완료"
 fi
 

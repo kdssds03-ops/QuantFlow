@@ -493,7 +493,7 @@ def _fetch_balance_with_retry(exchange: "ccxt.Exchange") -> dict:
     last_exc: Exception | None = None
     for attempt in range(1, _BALANCE_RETRY_MAX + 1):
         try:
-            return exchange.fetch_balance()
+            return exchange.fetch_balance({'type': 'future'})
         except (ccxt.NetworkError, ccxt.RequestTimeout) as exc:
             last_exc = exc
             if attempt < _BALANCE_RETRY_MAX:
@@ -581,6 +581,20 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
         from worker.indicators import compute_all_features
         df = compute_all_features(df)
 
+        import ta
+        if len(df) < 26:
+            logger.warning(f"⚠️ [DB Warm-up] 데이터 캔들 수가 부족하여 지표 계산을 스킵합니다. (현재: {len(df)}봉, 필요: 최소 26봉)")
+        else:
+            try:
+                df['atr_14'] = ta.volatility.average_true_range(high=df['high'], low=df['low'], close=df['close'], window=14)
+                df['macd_line'] = ta.trend.macd(close=df['close'], window_fast=12, window_slow=26)
+                df['macd_signal'] = ta.trend.macd_signal(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+                df['macd_hist'] = ta.trend.macd_diff(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+            except IndexError as e:
+                logger.warning(f"⚠️ [DB Warm-up] 지표 계산 중 IndexError 발생 (데이터 부족): {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ [DB Warm-up] 지표 계산 중 예외 발생: {e}")
+
         # ── NULL 지표 레코드만 선별하여 upsert ──────────────────────────────
         upsert_count = 0
         for i, r in enumerate(rows):
@@ -589,9 +603,13 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
             rsi_14_val   = _to_dec(row_feat.get("rsi_14"))
             bb_upper_val = _to_dec(row_feat.get("bb_upper"))
             bb_lower_val = _to_dec(row_feat.get("bb_lower"))
+            atr_14_val      = _to_dec(row_feat.get("atr_14"))
+            macd_line_val   = _to_dec(row_feat.get("macd_line"))
+            macd_signal_val = _to_dec(row_feat.get("macd_signal"))
+            macd_hist_val   = _to_dec(row_feat.get("macd_hist"))
 
             # 지표가 NULL인 행만 upsert (정상 행 불필요한 재기록 방지)
-            if r.rsi_14 is None or r.bb_upper is None or r.bb_lower is None:
+            if r.rsi_14 is None or r.bb_upper is None or r.bb_lower is None or getattr(r, 'atr_14', None) is None:
                 ts_utc = _normalize_ts(r.timestamp)
                 stmt = pg_insert(MarketData).values(
                     timestamp=ts_utc,
@@ -605,6 +623,10 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
                     rsi_14=rsi_14_val,
                     bb_upper=bb_upper_val,
                     bb_lower=bb_lower_val,
+                    atr_14=atr_14_val,
+                    macd_line=macd_line_val,
+                    macd_signal=macd_signal_val,
+                    macd_hist=macd_hist_val,
                 ).on_conflict_do_update(
                     constraint="uq_market_data_ts_symbol",
                     set_={
@@ -612,6 +634,10 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
                         "rsi_14":   pg_insert(MarketData).excluded.rsi_14,
                         "bb_upper": pg_insert(MarketData).excluded.bb_upper,
                         "bb_lower": pg_insert(MarketData).excluded.bb_lower,
+                        "atr_14":   pg_insert(MarketData).excluded.atr_14,
+                        "macd_line": pg_insert(MarketData).excluded.macd_line,
+                        "macd_signal": pg_insert(MarketData).excluded.macd_signal,
+                        "macd_hist": pg_insert(MarketData).excluded.macd_hist,
                     },
                 )
                 for session in _get_sync_session():
@@ -677,6 +703,20 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         from worker.indicators import compute_all_features
         df = compute_all_features(df)
 
+        import ta
+        if len(df) < 26:
+            logger.warning(f"⚠️ [실시간 수집] 데이터 캔들 수가 부족하여 지표 계산을 스킵합니다. (현재: {len(df)}봉)")
+        else:
+            try:
+                df['atr_14'] = ta.volatility.average_true_range(high=df['high'], low=df['low'], close=df['close'], window=14)
+                df['macd_line'] = ta.trend.macd(close=df['close'], window_fast=12, window_slow=26)
+                df['macd_signal'] = ta.trend.macd_signal(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+                df['macd_hist'] = ta.trend.macd_diff(close=df['close'], window_fast=12, window_slow=26, window_sign=9)
+            except IndexError as e:
+                logger.warning(f"⚠️ [실시간 수집] 지표 계산 중 IndexError 발생: {e}")
+            except Exception as e:
+                logger.warning(f"⚠️ [실시간 수집] 지표 계산 중 예외 발생: {e}")
+
         last = df.iloc[-1]
         # ── [Timezone Fix] UTC timezone-aware datetime 강제 보장 ─────────────
         candle_dt = _ensure_utc(int(last["timestamp_ms"]))
@@ -687,10 +727,19 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         _raw_rsi    = last.get("rsi_14")
         _raw_upper  = last.get("bb_upper")
         _raw_lower  = last.get("bb_lower")
+        _raw_atr    = last.get("atr_14")
+        _raw_macd_l = last.get("macd_line")
+        _raw_macd_s = last.get("macd_signal")
+        _raw_macd_h = last.get("macd_hist")
+
         sma_20   = _to_dec(_raw_sma)   if not pd.isna(_raw_sma)   else None
         rsi_14   = _to_dec(_raw_rsi)   if not pd.isna(_raw_rsi)   else None
         bb_upper = _to_dec(_raw_upper) if not pd.isna(_raw_upper) else None
         bb_lower = _to_dec(_raw_lower) if not pd.isna(_raw_lower) else None
+        atr_14      = _to_dec(_raw_atr)    if not pd.isna(_raw_atr)    else None
+        macd_line   = _to_dec(_raw_macd_l) if not pd.isna(_raw_macd_l) else None
+        macd_signal = _to_dec(_raw_macd_s) if not pd.isna(_raw_macd_s) else None
+        macd_hist   = _to_dec(_raw_macd_h) if not pd.isna(_raw_macd_h) else None
 
         insert_stmt = pg_insert(MarketData).values(
             timestamp=candle_dt,
@@ -704,6 +753,10 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
             rsi_14=rsi_14,
             bb_upper=bb_upper,
             bb_lower=bb_lower,
+            atr_14=atr_14,
+            macd_line=macd_line,
+            macd_signal=macd_signal,
+            macd_hist=macd_hist,
         )
         stmt = insert_stmt.on_conflict_do_update(
             constraint="uq_market_data_ts_symbol",
@@ -712,6 +765,10 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
                 "rsi_14":   insert_stmt.excluded.rsi_14,
                 "bb_upper": insert_stmt.excluded.bb_upper,
                 "bb_lower": insert_stmt.excluded.bb_lower,
+                "atr_14":   insert_stmt.excluded.atr_14,
+                "macd_line": insert_stmt.excluded.macd_line,
+                "macd_signal": insert_stmt.excluded.macd_signal,
+                "macd_hist": insert_stmt.excluded.macd_hist,
             },
         )
 
@@ -738,6 +795,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
     logger.info(f"🧠 QuantFlow 하이브리드 의사결정 엔진 가동: {symbol}")
 
     try:
+        now_utc = datetime.now(timezone.utc)
         exchange = get_exchange()
         
         # 1. 실시간 자산 잔고 트래킹 — 3회 자동 재시도 보장 (8차 확장)
@@ -1029,15 +1087,32 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             if action == "HOLD":
                 return {"status": "hold_or_low_confidence", "confidence": confidence}
 
-            # 6. ⏳ 멱등성 보장을 위한 5분 쿨다운 검사
-            cooldown_cutoff = datetime.now(timezone.utc) - timedelta(minutes=COOLDOWN_MINUTES)
+            # 6. 📈 피라미딩(Pyramiding) 매매 로직 (수학적 평단가 방어)
+            PRICE_BUFFER_PCT = Decimal("0.005")  # 0.5%
+            
+            # 최근 5분 이내 동일 방향 거래 이력 조회
+            cooldown_cutoff = now_utc - timedelta(minutes=COOLDOWN_MINUTES)
             recent_same_side = session.query(TradeHistory).filter(
                 TradeHistory.symbol == symbol, TradeHistory.side == action, TradeHistory.timestamp >= cooldown_cutoff
-            ).first()
+            ).order_by(desc(TradeHistory.timestamp)).first()
 
             if recent_same_side is not None:
-                logger.warning(f"⏳ 쿨다운 필터 발동: {action} 주문 생성 스킵")
-                return {"status": "cooldown_skipped"}
+                last_price = Decimal(str(recent_same_side.price))
+                
+                if action == "SELL":
+                    # 숏 추가 진입: 현재가가 직전 체결가보다 최소 0.5% 이상 높아야 유리한 평단가 방어 가능
+                    required_price = last_price * (Decimal("1") + PRICE_BUFFER_PCT)
+                    if current_close < required_price:
+                        logger.warning(f"⏳ [피라미딩 가드] {action} 스킵: 현재가({current_close:.2f})가 조건({required_price:.2f})에 미달하여 유리한 단가가 아님.")
+                        return {"status": "pyramiding_skipped"}
+                elif action == "BUY":
+                    # 숏 분할 청산: 현재가가 직전 체결가보다 최소 0.5% 이상 낮아야 유리함
+                    required_price = last_price * (Decimal("1") - PRICE_BUFFER_PCT)
+                    if current_close > required_price:
+                        logger.warning(f"⏳ [피라미딩 가드] {action} 스킵: 현재가({current_close:.2f})가 조건({required_price:.2f})에 미달하여 유리한 단가가 아님.")
+                        return {"status": "pyramiding_skipped"}
+                        
+                logger.info(f"📈 [피라미딩 통과] 단가 방어 완료! {action} 연속 진입 승인 (현재가: {current_close:.2f} / 직전가: {last_price:.2f})")
 
             # 7. ⚡ 주문 분기점 정의 (신규 숏 진입 vs 숏 청산) 및 동적 주문 수량 계산
             trigger_type = "SNIPER_SHORT_ENTRY"
@@ -1087,7 +1162,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 else calculated_amount
             )
             trade_record = TradeHistory(
-                timestamp=datetime.now(timezone.utc), symbol=symbol, side=action,
+                timestamp=now_utc, symbol=symbol, side=action,
                 price=exec_result["filled_price"], amount=record_amount,
                 status=exec_result["status"],
             )
@@ -1299,8 +1374,8 @@ def _send_status_brief():
             exchange.set_sandbox_mode(True)
             
         balance_info = _fetch_balance_with_retry(exchange)
-        usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
-        btc_balance = Decimal(str(balance_info["total"].get("BTC", 0.0)))
+        usdt_free = Decimal(str(balance_info["free"].get("USDT", 0.0)))
+        total_assets = Decimal(str(balance_info["total"].get("USDT", 0.0)))
         
         symbol = "BTC/USDT"
         
@@ -1315,13 +1390,19 @@ def _send_status_brief():
             
             current_close = Decimal(str(latest.close))
             rsi_val = float(latest.rsi_14) if latest.rsi_14 is not None else 0.0
-            bb_upper_val = float(latest.bb_upper) if latest.bb_upper is not None else 0.0
-            bb_lower_val = float(latest.bb_lower) if latest.bb_lower is not None else 0.0
-            sma_val = float(latest.sma_20) if latest.sma_20 is not None else 0.0
-            
-            # 총 자산 가치 = USDT 잔고 + BTC 잔고 * 현재가
-            total_assets = usdt_balance + (btc_balance * current_close)
-            
+            bb_upper_val = float(latest.bb_upper) if latest.bb_upper is not None else float(current_close)
+            bb_lower_val = float(latest.bb_lower) if latest.bb_lower is not None else float(current_close)
+            sma_val = float(latest.sma_20) if latest.sma_20 is not None else float(current_close)
+
+            logger.debug(
+                "📊 [브리핑 디버그] close=%.2f | sma_20=%s | bb_upper=%s | bb_lower=%s | rsi=%.2f",
+                float(current_close),
+                latest.sma_20,
+                latest.bb_upper,
+                latest.bb_lower,
+                rsi_val,
+            )
+
             # 포지션 분석
             last_trade = session.query(TradeHistory).filter(
                 TradeHistory.symbol == symbol, TradeHistory.status == "FILLED"
@@ -1351,11 +1432,20 @@ def _send_status_brief():
                 entry_price = Decimal(str(ccxt_pos.get('entryPrice', 0)))
                 pos_amount = Decimal(str(ccxt_pos.get('contracts', 0)))
                 
-                # 수익률 계산 (숏 기준: 진입가 - 현재가, 롱 기준: 현재가 - 진입가)
-                if current_position == "SHORT":
-                    pos_return = (entry_price - current_close) / entry_price * 100
+                # 바이낸스 선물(USDM-Futures) 실제 언리얼라이즈드 PNL 및 ROI 기반 수익률 추출
+                if ccxt_pos.get('percentage') is not None:
+                    pos_return = float(ccxt_pos['percentage'])
                 else:
-                    pos_return = (current_close - entry_price) / entry_price * 100
+                    unrealized = float(ccxt_pos.get('unrealizedPnl', 0.0))
+                    pos_value = float(entry_price * pos_amount)
+                    if pos_value > 0:
+                        pos_return = (unrealized / pos_value) * 100
+                    else:
+                        if current_position == "SHORT":
+                            pos_return = float((entry_price - current_close) / entry_price * 100)
+                        else:
+                            pos_return = float((current_close - entry_price) / entry_price * 100)
+                            
                 pos_pnl_str = f" ({pos_return:+.2f}%)"
                 
                 # 진입 시간 경과 (DB의 마지막 거래 이력 참조)
@@ -1429,11 +1519,10 @@ def _send_status_brief():
                 f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
                 f"• <b>경과 시간:</b> <code>{pos_duration_str or '-'}</code>" if entry_price else "• <b>경과 시간:</b> <code>-</code>",
                 "",
-                "💰 <b>실시간 자산 잔고</b>",
+                "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
                 "────────────────────",
-                f"• <b>가용 USDT:</b> <code>${float(usdt_balance):,.2f} USDT</code>",
-                f"• <b>보유 BTC:</b> <code>{float(btc_balance):.6f} BTC</code>",
-                f"• <b>총 자산 가치:</b> <code>${float(total_assets):,.2f} USDT</code>",
+                f"• <b>가용 잔고 (Free):</b> <code>${float(usdt_free):,.2f} USDT</code>",
+                f"• <b>총 자산 (Total):</b> <code>${float(total_assets):,.2f} USDT</code>",
                 f"• <b>24H 실현 손익:</b> <code>{pnl_24h_str}</code>",
                 "",
                 "📈 <b>실시간 시장 지표</b>",

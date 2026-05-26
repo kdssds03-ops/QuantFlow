@@ -25,15 +25,15 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: quantflow
+      POSTGRES_PASSWORD: quantflow
+      POSTGRES_DB: quantflow
     ports:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U quantflow -d quantflow"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -76,10 +76,8 @@ services:
       # 호스트 시간대 마운트 (WSL2/Linux)
       - /etc/localtime:/etc/localtime:ro
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - postgres
+      - redis
     # 마이그레이션 파이프라인 엔트리포인트 연결
     entrypoint: ["/bin/bash", "/opt/quantflow/scripts/entrypoint-api.sh"]
     command: >
@@ -103,6 +101,8 @@ services:
     container_name: qf-worker
     restart: unless-stopped
     env_file: .env
+    environment:
+      - NUMBA_DISABLE_JIT=1
     entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
     command: >
       celery -A worker.celery_app worker
@@ -118,12 +118,9 @@ services:
       # 호스트 시간대 마운트 (Linux/Mac/WSL)
       - /etc/localtime:/etc/localtime:ro
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      api:
-        condition: service_healthy
+      - postgres
+      - redis
+      - api
 
   # ── Celery Beat (스케줄러) ─────────────────
   # ⚠ api 서비스가 healthy 상태(마이그레이션 완료 + 서버 기동)가 된 후에만 기동
@@ -145,12 +142,9 @@ services:
       - /opt/quantflow/worker/__pycache__
       - /etc/localtime:/etc/localtime:ro
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      api:
-        condition: service_healthy
+      - postgres
+      - redis
+      - api
 
 volumes:
   pg_data:

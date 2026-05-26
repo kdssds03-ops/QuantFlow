@@ -28,9 +28,9 @@ class Settings(BaseSettings):
     postgres_host: str = "postgres"
     postgres_port: int = 5432
     postgres_user: str = "quantflow"
-    postgres_password: str = "quantflow_secret"
+    postgres_password: str = "quantflow"
     postgres_db: str = "quantflow"
-    database_url: str = "postgresql+asyncpg://quantflow:quantflow_secret@postgres:5432/quantflow"
+    database_url: str = "postgresql+asyncpg://quantflow:quantflow@postgres:5432/quantflow"
 
     # ── Redis ────────────────────────────────
     redis_host: str = "redis"

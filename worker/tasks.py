@@ -1637,6 +1637,49 @@ def _send_status_brief():
             kst_tz = timezone(timedelta(hours=9))
             now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
             
+            # ── 오늘 KST 00:00 이후 체결 내역 조회 (타임라인 전용) ───────────────
+            _kst_tz = timezone(timedelta(hours=9))
+            _now_kst = datetime.now(_kst_tz)
+            _start_of_day_kst = _now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
+            _start_of_day_utc = _start_of_day_kst.astimezone(timezone.utc)
+            
+            _today_trades = (
+                session.query(TradeHistory)
+                .filter(
+                    TradeHistory.symbol == symbol,
+                    TradeHistory.timestamp >= _start_of_day_utc,
+                    TradeHistory.status == "FILLED",
+                )
+                .order_by(TradeHistory.timestamp)
+                .all()
+            )
+            
+            # ── 타임라인 문자열 생성 ────────────────────────────────────────────
+            if _today_trades:
+                _timeline_lines = []
+                for _t in _today_trades:
+                    _ts = _t.timestamp
+                    if _ts.tzinfo is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    else:
+                        _ts = _ts.astimezone(timezone.utc)
+                    _ts_kst = _ts.astimezone(_kst_tz)
+                    _time_str = _ts_kst.strftime("%H:%M")
+                    if _t.side == "SELL":
+                        _side_str = "🔴 숏 진입 (or 롱 청산)"
+                    else:
+                        _side_str = "🟢 롱 진입 (or 숏 청산)"
+                    _price_str = f"${float(_t.price):,.2f}" if _t.price else "-"
+                    _qty_str   = f"{float(_t.amount):.6f}" if _t.amount else "-"
+                    _timeline_lines.append(
+                        f"[{_time_str}] {_side_str}\n"
+                        f"  ├ 체결가: <code>{_price_str}</code>\n"
+                        f"  └ 수량:  <code>{_qty_str} BTC</code>"
+                    )
+                _timeline_str = "\n".join(_timeline_lines)
+            else:
+                _timeline_str = "• 오늘 체결된 내역이 없습니다."
+            
             brief_lines = [
                 "📊 <b>[QuantFlow 실시간 관제 브리핑]</b>",
                 "━━━━━━━━━━━━━━━━━━━━",
@@ -1650,6 +1693,10 @@ def _send_status_brief():
                 # 🔑 [버그픽스] pos_duration_str을 직접 체크하여 경과 시간이 항상 출력되도록 보정.
                 # entry_price 조건이 아닌 pos_duration_str 자체의 유효성을 기준으로 분기합니다.
                 f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>" if (pos_duration_str and pos_duration_str != "-") else "• <b>경과 시간:</b> <code>-</code>",
+                "",
+                "📝 <b>오늘 상세 매매 타임라인</b>",
+                "────────────────────",
+                _timeline_str,
                 "",
                 "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
                 "────────────────────",
@@ -2066,7 +2113,35 @@ def generate_daily_report_task():
 
             report_time_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 
-            # ── [STEP 5] 리포트 메시지 조립 ─────────────────────────────────────
+            # ── [STEP 5] 오늘 매매 타임라인 생성 ────────────────────────────────
+            _dr_kst_tz = timezone(timedelta(hours=9))
+            _today_filled = [t for t in today_trades if t.status == "FILLED"]
+            if _today_filled:
+                _dr_timeline_lines = []
+                for _t in _today_filled:
+                    _ts = _t.timestamp
+                    if _ts.tzinfo is None:
+                        _ts = _ts.replace(tzinfo=timezone.utc)
+                    else:
+                        _ts = _ts.astimezone(timezone.utc)
+                    _ts_kst = _ts.astimezone(_dr_kst_tz)
+                    _time_str = _ts_kst.strftime("%H:%M")
+                    if _t.side == "SELL":
+                        _side_str = "🔴 숏 진입 (or 롱 청산)"
+                    else:
+                        _side_str = "🟢 롱 진입 (or 숏 청산)"
+                    _price_str = f"${float(_t.price):,.2f}" if _t.price else "-"
+                    _qty_str   = f"{float(_t.amount):.6f}" if _t.amount else "-"
+                    _dr_timeline_lines.append(
+                        f"[{_time_str}] {_side_str}\n"
+                        f"  ├ 체결가: <code>{_price_str}</code>\n"
+                        f"  └ 수량:  <code>{_qty_str} BTC</code>"
+                    )
+                _daily_timeline_str = "\n".join(_dr_timeline_lines)
+            else:
+                _daily_timeline_str = "• 오늘 체결된 내역이 없습니다."
+
+            # ── [STEP 6] 리포트 메시지 조립 ─────────────────────────────────────
             report_lines = [
                 "📊 <b>[QuantFlow 일일 결산 리포트]</b>",
                 "━━━━━━━━━━━━━━━━━━━━",
@@ -2085,6 +2160,10 @@ def generate_daily_report_task():
                 # 🔑 [버그픽스] pos_duration_str 자체의 유효성을 직접 체크
                 f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>" if (pos_duration_str and pos_duration_str != "-") else "• <b>경과 시간:</b> <code>-</code>",
                 f"• <b>미실현 손익:</b> <code>{unrealized_pnl_str}</code>" if unrealized_pnl_str else "• <b>미실현 손익:</b> <code>-</code>",
+                "",
+                "📝 <b>오늘 상세 매매 타임라인</b>",
+                "────────────────────",
+                _daily_timeline_str,
                 "",
                 "📋 <b>오늘 하루 매매 요약</b>",
                 "────────────────────",

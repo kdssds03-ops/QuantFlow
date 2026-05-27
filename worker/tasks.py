@@ -158,11 +158,24 @@ _BALANCE_RETRY_WAIT_SEC = 1         # fetch_balance 재시도 대기 (초)
 
 # ── [v9.2] Peak ROI 인메모리 추적 레지스터 ───────────────────────────────
 # 포지션별 최고 수익률(Peak ROI)을 워커 프로세스 메모리에 영속 유지.
-# key: symbol (str), value: Decimal (최고 수익률, 0.0 미만은 발생 불가)
+# key: symbol (str, 정규화된 포맷 — 슬래시/하이픈 제거, 예: "BTCUSDT"), value: Decimal
 # 포지션 진입(SELL) 시 0으로 초기화, 청산 완료 시 삭제.
 # Celery prefork 환경에서 단일 프로세스 기준이므로, 워커 재기동 시 리셋됨.
 # (재기동 후 복구가 필요하면 Redis 연동으로 확장 가능)
 _peak_roi_register: dict[str, Decimal] = {}
+
+
+def _normalize_symbol(symbol: str) -> str:
+    """
+    🔑 [심볼 정규화 헬퍼] 바이낸스 raw 포맷("BTCUSDT")과 CCXT 포맷("BTC/USDT") 간의
+    KeyMismatch를 방지하기 위해 슬래시(/) 및 하이픈(-)을 제거한 통합 키로 정규화합니다.
+
+    예시:
+        "BTC/USDT"  -> "BTCUSDT"
+        "BTC-USDT"  -> "BTCUSDT"
+        "BTCUSDT"   -> "BTCUSDT"  (이미 정규화됨, 그대로 반환)
+    """
+    return symbol.replace("/", "").replace("-", "").upper()
 
 
 # ─────────────────────────────────────────────
@@ -1029,14 +1042,16 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 # ── [Guard-B] Peak ROI 추적 레지스터 업데이트 ─────────────────────
                 # 매 루프마다 현재 수익률이 과거 최고점을 경신하면 갱신.
                 # price_return이 음수(손실 중)이면 기존 peak 값은 보존됨.
-                _current_peak = _peak_roi_register.get(symbol, Decimal("0"))
+                # 🔑 심볼 정규화: 바이낸스 raw "BTCUSDT" ↔ 내부 "BTC/USDT" KeyMismatch 방지
+                _reg_key = _normalize_symbol(symbol)
+                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
                 if price_return > _current_peak:
-                    _peak_roi_register[symbol] = price_return
+                    _peak_roi_register[_reg_key] = price_return
                     logger.info(
-                        "📈 [TRAILING_STOP] Peak ROI 신고점 갱신: symbol=%s, peak=%.2f%%, current=%.2f%%",
-                        symbol, float(price_return) * 100, float(price_return) * 100,
+                        "📈 [TRAILING_STOP] Peak ROI 신고점 갱신: symbol=%s (key=%s), peak=%.2f%%, current=%.2f%%",
+                        symbol, _reg_key, float(price_return) * 100, float(price_return) * 100,
                     )
-                _current_peak = _peak_roi_register.get(symbol, Decimal("0"))
+                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
 
                 _hard_trigger: str | None = None
                 _hard_reason: str = ""
@@ -1105,10 +1120,11 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     ))
 
                     # ── 청산 완료 후 Peak ROI 레지스터 초기화 (다음 포지션에서 재출발) ──
-                    _peak_roi_register.pop(symbol, None)
+                    # 🔑 정규화된 키로 삭제하여 잔류 데이터 방지
+                    _peak_roi_register.pop(_normalize_symbol(symbol), None)
                     logger.info(
-                        "🧹 [%s] Peak ROI 레지스터 초기화 완료 (symbol=%s)",
-                        _hard_trigger, symbol,
+                        "🧹 [%s] Peak ROI 레지스터 초기화 완료 (symbol=%s, key=%s)",
+                        _hard_trigger, symbol, _normalize_symbol(symbol),
                     )
 
                     # ── 가드별 차별화 텔레그램 알림 발송 ─────────────────────────
@@ -1207,9 +1223,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
             # [v9.2] 신규 숏 진입(SELL) 시 Peak ROI 레지스터를 0으로 초기화
             # — 이전 포지션의 잔류 peak 값이 새 포지션 판단에 오염되는 것을 차단
+            # 🔑 정규화된 키로 초기화하여 바이낸스 raw 심볼과의 KeyMismatch 방지
             if action == "SELL":
-                _peak_roi_register[symbol] = Decimal("0")
-                logger.info("🔄 [TRAILING_STOP] 새 숏 진입 — Peak ROI 레지스터 초기화: symbol=%s", symbol)
+                _peak_roi_register[_normalize_symbol(symbol)] = Decimal("0")
+                logger.info(
+                    "🔄 [TRAILING_STOP] 새 숏 진입 — Peak ROI 레지스터 초기화: symbol=%s (key=%s)",
+                    symbol, _normalize_symbol(symbol),
+                )
 
             # 동적 주문 수량 연산 (USDT 10% 숏 진입 vs 진입수량 환매수 청산)
             if action == "SELL":
@@ -1540,18 +1560,32 @@ def _send_status_brief():
                             
                 pos_pnl_str = f" ({pos_return:+.2f}%)"
                 
-                # 진입 시간 경과 (DB의 마지막 거래 이력 참조)
-                pos_duration_str = ""
-                if last_trade:
-                    entry_ts = last_trade.timestamp
+                # ── 진입 시간 경과: DB의 가장 최근 SELL(숏 진입) 이력 기준 ────────────
+                # 🔑 [버그픽스] last_trade가 BUY(청산 이력)일 경우 경과 시간이 의미 없으므로
+                #   반드시 side == "SELL" 인 마지막 진입 시각만 참조합니다.
+                #   심볼은 슬래시 포맷("BTC/USDT")으로 DB에 저장되므로 DB 조회에는 원본 symbol 사용.
+                pos_duration_str = "-"
+                last_sell_trade = session.query(TradeHistory).filter(
+                    TradeHistory.symbol == symbol,
+                    TradeHistory.side == "SELL",
+                    TradeHistory.status == "FILLED",
+                ).order_by(desc(TradeHistory.timestamp)).first()
+                if last_sell_trade:
+                    entry_ts = last_sell_trade.timestamp
                     if entry_ts.tzinfo is None:
                         entry_ts = entry_ts.replace(tzinfo=timezone.utc)
                     else:
                         entry_ts = entry_ts.astimezone(timezone.utc)
                     minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                    pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+                    pos_duration_str = f"{minutes_held:.0f}분 보유"
+                    logger.debug(
+                        "📊 [브리핑] CCXT 포지션 경과 시간 계산 완료: entry_ts=%s, minutes=%.1f",
+                        entry_ts.isoformat(), minutes_held,
+                    )
             else:
                 # Fallback: DB 기준 로직 (v9.1.0 숏 진입 기준)
+                # 🔑 [버그픽스] last_trade.side == "SELL" 조건을 명시적으로 검사하여
+                #   청산(BUY) 이후에도 포지션이 SHORT으로 오인되는 것을 방지합니다.
                 if last_trade and last_trade.side == "SELL":
                     current_position = "SHORT"
                     entry_price = Decimal(str(last_trade.price))
@@ -1564,7 +1598,11 @@ def _send_status_brief():
                     else:
                         entry_ts = entry_ts.astimezone(timezone.utc)
                     minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                    pos_duration_str = f" ({minutes_held:.0f}분 보유)"
+                    pos_duration_str = f"{minutes_held:.0f}분 보유"
+                    logger.debug(
+                        "📊 [브리핑] DB Fallback 경과 시간 계산 완료: entry_ts=%s, minutes=%.1f",
+                        entry_ts.isoformat(), minutes_held,
+                    )
 
             # 최근 24시간 실현 손익 집계
             cutoff = datetime.now(timezone.utc) - timedelta(days=1)
@@ -1609,7 +1647,9 @@ def _send_status_brief():
                 "────────────────────",
                 f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
                 f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
-                f"• <b>경과 시간:</b> <code>{pos_duration_str or '-'}</code>" if entry_price else "• <b>경과 시간:</b> <code>-</code>",
+                # 🔑 [버그픽스] pos_duration_str을 직접 체크하여 경과 시간이 항상 출력되도록 보정.
+                # entry_price 조건이 아닌 pos_duration_str 자체의 유효성을 기준으로 분기합니다.
+                f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>" if (pos_duration_str and pos_duration_str != "-") else "• <b>경과 시간:</b> <code>-</code>",
                 "",
                 "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
                 "────────────────────",

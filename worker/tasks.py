@@ -1638,16 +1638,18 @@ def _send_status_brief():
             now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
             
             # ── 오늘 KST 00:00 이후 체결 내역 조회 (타임라인 전용) ───────────────
+            # 🔑 [버그픽스] KST→UTC 변환 오차(9시간 시프트)로 인해 자정 직후 체결 내역이
+            #   누락되는 버그를 방지하기 위해, timezone-naive KST 자정 기준점을 직접 생성하여
+            #   DB의 naive timestamp 컬럼과 직접 비교합니다.
             _kst_tz = timezone(timedelta(hours=9))
             _now_kst = datetime.now(_kst_tz)
-            _start_of_day_kst = _now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-            _start_of_day_utc = _start_of_day_kst.astimezone(timezone.utc)
+            _start_of_day_naive = datetime(_now_kst.year, _now_kst.month, _now_kst.day, 0, 0, 0)
             
             _today_trades = (
                 session.query(TradeHistory)
                 .filter(
                     TradeHistory.symbol == symbol,
-                    TradeHistory.timestamp >= _start_of_day_utc,
+                    TradeHistory.timestamp >= _start_of_day_naive,
                     TradeHistory.status == "FILLED",
                 )
                 .order_by(TradeHistory.timestamp)
@@ -1865,9 +1867,10 @@ def generate_daily_report_task():
         kst_tz = timezone(timedelta(hours=9))
         now_kst = datetime.now(kst_tz)
         
-        # 오늘 KST 00:00:00 계산 후 UTC로 변환하여 DB 조회
-        start_of_day_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
-        start_of_day_utc = start_of_day_kst.astimezone(timezone.utc)
+        # 🔑 [버그픽스] KST→UTC 변환 오차(9시간 시프트)로 인해 자정 직후 체결 내역이
+        #   누락되는 버그를 방지하기 위해, timezone-naive KST 자정 기준점을 직접 생성하여
+        #   DB의 naive timestamp 컬럼과 직접 비교합니다.
+        start_of_day_naive = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0)
         
         # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
@@ -2010,14 +2013,14 @@ def generate_daily_report_task():
                 session.query(TradeHistory)
                 .filter(
                     TradeHistory.symbol    == symbol,
-                    TradeHistory.timestamp >= start_of_day_utc,
+                    TradeHistory.timestamp >= start_of_day_naive,
                 )
                 .order_by(TradeHistory.timestamp)
                 .all()
             )
             logger.info(
-                "📊 [일일결산] 오늘 거래 스캔: symbol=%s (normalized=%s), start=%s UTC, count=%d건",
-                symbol, symbol_normalized, start_of_day_utc.isoformat(), len(today_trades),
+                "📊 [일일결산] 오늘 거래 스캔: symbol=%s (normalized=%s), start=%s KST(naive), count=%d건",
+                symbol, symbol_normalized, start_of_day_naive.isoformat(), len(today_trades),
             )
 
             # ── [STEP 3] 숏 전략 기반 PnL 계산 ────────────────────────────────

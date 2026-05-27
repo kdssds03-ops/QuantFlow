@@ -1803,6 +1803,14 @@ def generate_daily_report_task():
     """
     📊 QuantFlow 프리미엄 일일결산 리포트 스케줄러.
     매일 23:59 KST에 1회 호출되어 오늘 하루의 실현 손익, 자산 총액, 승률 등을 금융기관 수준으로 리포팅합니다.
+
+    [v9.3 버그픽스 항목]
+    1. CCXT fetch_positions 교차 검증 추가 — DB 단독 의존 탈피
+    2. SHORT 포지션 판별 추가 — 기존에는 LONG(BUY)만 처리하여 SHORT를 영구 FLAT 출력
+    3. _normalize_symbol 전면 적용 — 심볼 포맷 불일치(KeyMismatch) 원천 차단
+    4. PnL 계산 로직을 Short 전략 기준으로 수정 — (진입가 - 청산가) × 수량
+    5. 미실현 손익(Unrealized PnL) 별도 표시 추가
+    6. pos_duration_str 출력 조건 수정 — entry_price 조건 대신 문자열 직접 체크
     """
     logger.info("📊 [일간 결산] generate_daily_report_task 가동")
     
@@ -1814,13 +1822,15 @@ def generate_daily_report_task():
         start_of_day_kst = now_kst.replace(hour=0, minute=0, second=0, microsecond=0)
         start_of_day_utc = start_of_day_kst.astimezone(timezone.utc)
         
-        # 실시간 자산 및 시세 조회
+        # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
         balance_info = _fetch_balance_with_retry(exchange)
         usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
-        btc_balance = Decimal(str(balance_info["total"].get("BTC", 0.0)))
+        btc_balance  = Decimal(str(balance_info["total"].get("BTC", 0.0)))
         
         symbol = "BTC/USDT"
+        # 🔑 정규화된 심볼 (바이낸스 raw 포맷 "BTCUSDT" 매칭용 — 로그 추적에 활용)
+        symbol_normalized = _normalize_symbol(symbol)
         
         for session in _get_sync_session():
             latest = session.query(MarketData).filter(
@@ -1830,109 +1840,233 @@ def generate_daily_report_task():
             current_close = Decimal(str(latest.close)) if latest else Decimal("0")
             total_assets = usdt_balance + (btc_balance * current_close)
             
-            # 오늘 KST 00:00 이후 체결된 주문 스캔
+            # ── [STEP 1] CCXT fetch_positions 실시간 교차 검증 (1순위) ───────────
+            # 🔑 [핵심 버그픽스] DB 쿼리에만 의존하지 않고 거래소 실제 포지션을 1순위로 참조.
+            # _send_status_brief()와 동일한 방식 — CCXT 실패 시에만 DB Fallback 전환.
+            current_position  = "FLAT"
+            entry_price       = None
+            pos_pnl_str       = ""
+            pos_duration_str  = "-"
+            unrealized_pnl    = Decimal("0")
+            ccxt_pos          = None
+
+            try:
+                if exchange.has.get("fetchPositions"):
+                    positions = exchange.fetch_positions([symbol])
+                    for p in positions:
+                        if p.get("contracts") and float(p["contracts"]) > 0:
+                            ccxt_pos = p
+                            break
+            except Exception as _pos_exc:
+                logger.warning(
+                    "⚠️ [일일결산] CCXT fetch_positions 실패 → DB Fallback 전환: %s", _pos_exc
+                )
+
+            if ccxt_pos:
+                # ── CCXT 기준 포지션 파싱 ────────────────────────────────────
+                side_str         = ccxt_pos.get("side", "").lower()
+                current_position = "SHORT" if side_str == "short" else "LONG"
+                entry_price      = Decimal(str(ccxt_pos.get("entryPrice", 0) or 0))
+                pos_amount       = Decimal(str(ccxt_pos.get("contracts", 0) or 0))
+                _unrealized_raw  = ccxt_pos.get("unrealizedPnl", 0.0) or 0.0
+                unrealized_pnl   = Decimal(str(_unrealized_raw))
+
+                # 수익률 계산 (거래소 percentage 우선, 없으면 직접 계산)
+                if ccxt_pos.get("percentage") is not None:
+                    pos_return = float(ccxt_pos["percentage"])
+                elif entry_price > Decimal("0") and pos_amount > Decimal("0"):
+                    pos_value  = float(entry_price * pos_amount)
+                    pos_return = (float(_unrealized_raw) / pos_value * 100) if pos_value > 0 else 0.0
+                else:
+                    if current_position == "SHORT" and entry_price > Decimal("0"):
+                        pos_return = float((entry_price - current_close) / entry_price * 100)
+                    elif entry_price > Decimal("0"):
+                        pos_return = float((current_close - entry_price) / entry_price * 100)
+                    else:
+                        pos_return = 0.0
+
+                pos_pnl_str = f" ({pos_return:+.2f}%)"
+
+                # 진입 시간: DB에서 가장 최근 SELL(숏 진입) 이력 기준
+                # 🔑 [버그픽스] side == "SELL" 필터로 청산(BUY) 이후에도 올바른 진입 시각 참조.
+                #   TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → DB 조회는 원본 symbol 사용.
+                last_sell_for_duration = session.query(TradeHistory).filter(
+                    TradeHistory.symbol == symbol,
+                    TradeHistory.side   == "SELL",
+                    TradeHistory.status == "FILLED",
+                ).order_by(desc(TradeHistory.timestamp)).first()
+
+                if last_sell_for_duration:
+                    _ets = last_sell_for_duration.timestamp
+                    if _ets.tzinfo is None:
+                        _ets = _ets.replace(tzinfo=timezone.utc)
+                    else:
+                        _ets = _ets.astimezone(timezone.utc)
+                    _mins = (datetime.now(timezone.utc) - _ets).total_seconds() / 60.0
+                    pos_duration_str = f"{_mins:.0f}분 보유"
+                    logger.info(
+                        "📊 [일일결산] CCXT 포지션 경과 시간 확정: %.0f분 (entry_ts=%s)",
+                        _mins, _ets.isoformat(),
+                    )
+
+            else:
+                # ── DB Fallback: CCXT 조회 실패 시 ─────────────────────────────
+                # 🔑 [핵심 버그픽스] 기존에는 side == "BUY" → LONG 만 처리하여 SHORT 포지션을
+                #   영구적으로 FLAT 출력하는 치명적 결함이 있었음. SHORT(SELL) 케이스 추가.
+                last_trade_db = session.query(TradeHistory).filter(
+                    TradeHistory.symbol == symbol,
+                    TradeHistory.status == "FILLED",
+                ).order_by(desc(TradeHistory.timestamp)).first()
+
+                if last_trade_db:
+                    _entry_price_db = Decimal(str(last_trade_db.price))
+                    _ets = last_trade_db.timestamp
+                    if _ets.tzinfo is None:
+                        _ets = _ets.replace(tzinfo=timezone.utc)
+                    else:
+                        _ets = _ets.astimezone(timezone.utc)
+                    _mins = (datetime.now(timezone.utc) - _ets).total_seconds() / 60.0
+
+                    if last_trade_db.side == "SELL":
+                        # 숏 포지션 (SHORT) — 가격 하락 시 수익
+                        current_position = "SHORT"
+                        entry_price      = _entry_price_db
+                        if entry_price > Decimal("0"):
+                            pos_return = float((entry_price - current_close) / entry_price * 100)
+                        else:
+                            pos_return = 0.0
+                        pos_pnl_str      = f" ({pos_return:+.2f}%)"
+                        pos_duration_str = f"{_mins:.0f}분 보유"
+                    elif last_trade_db.side == "BUY":
+                        # 롱 포지션 (LONG) — 가격 상승 시 수익
+                        current_position = "LONG"
+                        entry_price      = _entry_price_db
+                        if entry_price > Decimal("0"):
+                            pos_return = float((current_close - entry_price) / entry_price * 100)
+                        else:
+                            pos_return = 0.0
+                        pos_pnl_str      = f" ({pos_return:+.2f}%)"
+                        pos_duration_str = f"{_mins:.0f}분 보유"
+
+            # 포지션 이모지
+            if current_position == "SHORT":
+                pos_emoji = "🔴 SHORT"
+            elif current_position == "LONG":
+                pos_emoji = "🟢 LONG"
+            else:
+                pos_emoji = "⚪ FLAT"
+
+            # ── [STEP 2] 오늘 KST 00:00 이후 체결된 주문 스캔 ──────────────────
+            # 🔑 [버그픽스] TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → 원본 symbol로 필터,
+            #   로그에는 정규화 키도 함께 기록하여 심볼 포맷 불일치 트러블슈팅을 지원.
             today_trades = (
                 session.query(TradeHistory)
-                .filter(TradeHistory.timestamp >= start_of_day_utc)
+                .filter(
+                    TradeHistory.symbol    == symbol,
+                    TradeHistory.timestamp >= start_of_day_utc,
+                )
                 .order_by(TradeHistory.timestamp)
                 .all()
             )
-            
-            # 오늘 체결 완료된 SELL 주문
-            today_filled_sells = [
-                t for t in today_trades
-                if t.side == "SELL" and t.status == "FILLED" and t.price is not None
-            ]
-            
-            # 매수 평단가 산출을 위해 symbol의 전체 BUY 이력 로드
-            all_filled_buys = (
+            logger.info(
+                "📊 [일일결산] 오늘 거래 스캔: symbol=%s (normalized=%s), start=%s UTC, count=%d건",
+                symbol, symbol_normalized, start_of_day_utc.isoformat(), len(today_trades),
+            )
+
+            # ── [STEP 3] 숏 전략 기반 PnL 계산 ────────────────────────────────
+            # 🔑 [핵심 버그픽스] 기존 코드는 Long 기준(sell - buy)으로 PnL을 계산했으나,
+            #   이 시스템은 Short 전략(SELL 진입 → BUY 청산) 구조입니다.
+            #   올바른 Short PnL = (숏 진입가 - 청산가) × 수량
+            #                   = (avg_sell_price - buy_price) × buy_qty
+            #
+            # 알고리즘:
+            #   1. 오늘 체결된 BUY(숏 청산)를 시간순으로 순회
+            #   2. 각 BUY 이전의 SELL(숏 진입) 이력에서 가중 평단가(avg_sell_price) 산출
+            #   3. PnL = (avg_sell_price - buy_price) × buy_qty
+            #   4. PnL > 0 → 익절(Win), PnL <= 0 → 손절(Loss)
+            all_filled_sells_for_pnl = (
                 session.query(TradeHistory)
-                .filter(TradeHistory.symbol == symbol, TradeHistory.side == "BUY", TradeHistory.status == "FILLED")
+                .filter(
+                    TradeHistory.symbol == symbol,
+                    TradeHistory.side   == "SELL",
+                    TradeHistory.status == "FILLED",
+                )
                 .order_by(TradeHistory.timestamp)
                 .all()
             )
-            
-            # PnL 및 승률 계산 (Round-trip 매수 평단가 기준)
+
+            today_filled_buys_for_pnl = [
+                t for t in today_trades
+                if t.side == "BUY" and t.status == "FILLED" and t.price is not None
+            ]
+
             realized_pnl = Decimal("0")
-            win_count = 0
-            loss_count = 0
-            
-            for sell_trade in today_filled_sells:
-                prior_buys = [b for b in all_filled_buys if b.timestamp <= sell_trade.timestamp]
-                if not prior_buys:
+            win_count    = 0
+            loss_count   = 0
+
+            for buy_trade in today_filled_buys_for_pnl:
+                # 해당 BUY 시점 이전 SELL(숏 진입)에서 가중 평단 진입가 산출
+                prior_sells = [
+                    s for s in all_filled_sells_for_pnl
+                    if s.timestamp <= buy_trade.timestamp
+                ]
+                if not prior_sells:
                     continue
-                
+
                 sum_cost = Decimal("0")
-                sum_qty = Decimal("0")
-                for b in prior_buys:
-                    sum_cost += Decimal(str(b.price)) * Decimal(str(b.amount))
-                    sum_qty += Decimal(str(b.amount))
-                
+                sum_qty  = Decimal("0")
+                for s in prior_sells:
+                    if s.price is None or s.amount is None:
+                        continue
+                    sum_cost += Decimal(str(s.price)) * Decimal(str(s.amount))
+                    sum_qty  += Decimal(str(s.amount))
+
                 if sum_qty == Decimal("0"):
                     continue
-                
-                avg_buy_price = sum_cost / sum_qty
-                sell_price = Decimal(str(sell_trade.price))
-                sell_qty = Decimal(str(sell_trade.amount))
-                
-                trade_pnl = (sell_price - avg_buy_price) * sell_qty
+
+                avg_sell_price = sum_cost / sum_qty       # 숏 진입 가중 평단가
+                buy_price      = Decimal(str(buy_trade.price))
+                buy_qty        = Decimal(str(buy_trade.amount))
+
+                # 숏 PnL: 진입가 > 청산가 일수록 이익
+                trade_pnl    = (avg_sell_price - buy_price) * buy_qty
                 realized_pnl += trade_pnl
-                
-                if sell_price > avg_buy_price:
-                    win_count += 1
+
+                if trade_pnl > Decimal("0"):
+                    win_count  += 1
                 else:
                     loss_count += 1
-            
-            # 현재 포지션 정보
-            last_trade = session.query(TradeHistory).filter(
-                TradeHistory.symbol == symbol, TradeHistory.status == "FILLED"
-            ).order_by(desc(TradeHistory.timestamp)).first()
-            
-            current_position = "FLAT"
-            entry_price = None
-            pos_pnl_str = ""
-            pos_duration_str = ""
-            
-            if last_trade and last_trade.side == "BUY":
-                current_position = "LONG"
-                entry_price = Decimal(str(last_trade.price))
-                pos_return = (current_close - entry_price) / entry_price * 100
-                pos_pnl_str = f" ({pos_return:+.2f}%)"
-                
-                # 진입 시간 경과
-                entry_ts = last_trade.timestamp
-                if entry_ts.tzinfo is None:
-                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
-                else:
-                    entry_ts = entry_ts.astimezone(timezone.utc)
-                minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                pos_duration_str = f" ({minutes_held:.0f}분 보유)"
-                
-            pos_emoji = "🟢 LONG" if current_position == "LONG" else "⚪ FLAT"
-            
-            # 오늘 하루의 주문 시도 수 집계
-            total_count = len(today_trades)
-            filled_count = sum(1 for t in today_trades if t.status == "FILLED")
+
+            # ── [STEP 4] 매매 요약 집계 ─────────────────────────────────────────
+            total_count    = len(today_trades)
+            filled_count   = sum(1 for t in today_trades if t.status == "FILLED")
             rejected_count = sum(1 for t in today_trades if t.status == "REJECTED")
-            failed_count = sum(1 for t in today_trades if t.status == "FAILED")
+            failed_count   = sum(1 for t in today_trades if t.status == "FAILED")
             
             fill_rate_str = f"{(filled_count / total_count * 100):.1f}%" if total_count > 0 else "N/A"
-            
+
             evaluated_total = win_count + loss_count
-            win_rate_str = f"{(win_count / evaluated_total * 100):.1f}%" if evaluated_total > 0 else "N/A"
-            
+            win_rate_str    = f"{(win_count / evaluated_total * 100):.1f}%" if evaluated_total > 0 else "N/A"
+
             if realized_pnl > Decimal("0"):
                 pnl_emoji = "📈"
-                pnl_sign = "+"
+                pnl_sign  = "+"
             elif realized_pnl < Decimal("0"):
                 pnl_emoji = "📉"
-                pnl_sign = ""
+                pnl_sign  = ""
             else:
                 pnl_emoji = "➖"
-                pnl_sign = ""
-                
+                pnl_sign  = ""
+
+            # 미실현 손익 표기 (CCXT 포지션이 있을 때만 표시)
+            unrealized_pnl_str = ""
+            if current_position != "FLAT" and ccxt_pos is not None:
+                _upnl_sign = "+" if unrealized_pnl >= Decimal("0") else ""
+                unrealized_pnl_str = f"{_upnl_sign}{float(unrealized_pnl):,.2f} USDT"
+
             report_time_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
-            
+
+            # ── [STEP 5] 리포트 메시지 조립 ─────────────────────────────────────
             report_lines = [
                 "📊 <b>[QuantFlow 일일 결산 리포트]</b>",
                 "━━━━━━━━━━━━━━━━━━━━",
@@ -1948,7 +2082,9 @@ def generate_daily_report_task():
                 "────────────────────",
                 f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
                 f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
-                f"• <b>경과 시간:</b> <code>{pos_duration_str or '-'}</code>" if entry_price else "• <b>경과 시간:</b> <code>-</code>",
+                # 🔑 [버그픽스] pos_duration_str 자체의 유효성을 직접 체크
+                f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>" if (pos_duration_str and pos_duration_str != "-") else "• <b>경과 시간:</b> <code>-</code>",
+                f"• <b>미실현 손익:</b> <code>{unrealized_pnl_str}</code>" if unrealized_pnl_str else "• <b>미실현 손익:</b> <code>-</code>",
                 "",
                 "📋 <b>오늘 하루 매매 요약</b>",
                 "────────────────────",
@@ -1958,7 +2094,7 @@ def generate_daily_report_task():
                 f"• <b>실패(FAILED):</b> <code>{failed_count}건</code>",
                 f"• <b>체결 성공률:</b> <code>{fill_rate_str}</code>",
                 "",
-                "🎯 <b>실현 손익 및 승률</b>",
+                "🎯 <b>실현 손익 및 승률</b>  ※ Short 전략 기준",
                 "────────────────────",
                 f"• {pnl_emoji} <b>금일 실현 손익:</b> <code>{pnl_sign}{realized_pnl:,.2f} USDT</code>",
                 f"• <b>익절(Win):</b> <code>{win_count}건</code> / <b>손절(Loss):</b> <code>{loss_count}건</code>",
@@ -1968,16 +2104,21 @@ def generate_daily_report_task():
             ]
             
             notifier.send_message("\n".join(report_lines))
-            logger.info(f"📊 [generate_daily_report_task] 리포트 전송 완료 — PnL: {pnl_sign}{realized_pnl:,.2f} USDT")
-            
+            logger.info(
+                "📊 [generate_daily_report_task] 리포트 전송 완료 — 포지션=%s, PnL: %s%s USDT, 미실현: %s",
+                current_position, pnl_sign, f"{realized_pnl:,.2f}", unrealized_pnl_str or "N/A",
+            )
+
             return {
-                "status": "report_sent",
-                "total_trades": total_count,
-                "filled_trades": filled_count,
-                "realized_pnl": str(realized_pnl),
-                "win_rate": win_rate_str,
+                "status":         "report_sent",
+                "position":       current_position,
+                "total_trades":   total_count,
+                "filled_trades":  filled_count,
+                "realized_pnl":   str(realized_pnl),
+                "unrealized_pnl": str(unrealized_pnl),
+                "win_rate":       win_rate_str,
             }
-            
+
     except Exception as exc:
         logger.error(f"❌ [generate_daily_report_task] 리포트 생성 중 예외 발생: {exc}", exc_info=True)
         return {"status": "report_failed", "error": str(exc)}

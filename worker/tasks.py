@@ -139,7 +139,13 @@ CONFIDENCE_THRESHOLD = 0.65             # 스나이퍼 진입 확신도 65% Filt
 # ── [8차 확장] 하드 TP/SL + 타임아웃 안전장치 임계치 ────────────────────
 HARD_SL_THRESHOLD   = Decimal("-0.0150") # -1.5% 하드 손절 컷 (무조건 강제 청산)
 HARD_TP_THRESHOLD   = Decimal("0.0300")  # +3.0% 하드 익절 타겟 (무조건 강제 수확)
-MAX_POSITION_MINUTES = 180               # 최대 포지션 보유 시간 (180분 = 3시간)
+MAX_POSITION_MINUTES = 240               # 최대 포지션 보유 시간 (240분 = 4시간) [v9.2: 3h→4h]
+
+# ── [v9.2] 익절 보존형 트레일링 스탑 가드 임계치 ─────────────────────────
+# Peak ROI가 TRAILING_STOP_ACTIVATION_ROI 이상을 한 번이라도 터치한 뒤,
+# 고점 대비 수익률이 TRAILING_STOP_DRAWDOWN 이상 반납되면 즉시 전량 익절 청산.
+TRAILING_STOP_ACTIVATION_ROI = Decimal("0.1500")  # +15.0% — 트레일링 가드 활성화 기준선
+TRAILING_STOP_DRAWDOWN       = Decimal("0.0500")  # -5.0%  — 고점 대비 반납 허용 한계
 
 # ── [Phase 3] 주문 집행 파이프라인 설정 상수 ─────────────────────────────
 _ORDER_FILL_POLL_INTERVAL_SEC = 1   # 체결 폴링 간격 (초)
@@ -149,6 +155,14 @@ _ORDER_RETRY_WAIT_MIN_SEC = 1       # Exponential Backoff 최소 대기 (초)
 _ORDER_RETRY_WAIT_MAX_SEC = 8       # Exponential Backoff 최대 대기 (초)
 _BALANCE_RETRY_MAX = 3              # fetch_balance 재시도 최대 횟수
 _BALANCE_RETRY_WAIT_SEC = 1         # fetch_balance 재시도 대기 (초)
+
+# ── [v9.2] Peak ROI 인메모리 추적 레지스터 ───────────────────────────────
+# 포지션별 최고 수익률(Peak ROI)을 워커 프로세스 메모리에 영속 유지.
+# key: symbol (str), value: Decimal (최고 수익률, 0.0 미만은 발생 불가)
+# 포지션 진입(SELL) 시 0으로 초기화, 청산 완료 시 삭제.
+# Celery prefork 환경에서 단일 프로세스 기준이므로, 워커 재기동 시 리셋됨.
+# (재기동 후 복구가 필요하면 Redis 연동으로 확장 가능)
+_peak_roi_register: dict[str, Decimal] = {}
 
 
 # ─────────────────────────────────────────────
@@ -992,10 +1006,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
                     return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
 
-            # 4-1. ⏱️ [8차/9.1.0 확장] 하드 TP / 하드 SL / 타임아웃 안전장치 (우선순위 2위)
-            # ─────────────────────────────────────────────────────────────────────
-            # 지표 신호와 무관하게, 포지션이 극단적 수익/손실에 도달하거나
-            # 최대 보유 시간을 초과하면 무조건 강제 청산합니다.
+            # 4-1. ⏱️ [v9.2] 이중 리스크 가드 — 타임아웃 가드 + 트레일링 스탑 가드 (우선순위 2위)
+            # ═══════════════════════════════════════════════════════════════════════
+            # [Failsafe 순서]
+            #   Guard-A (최우선): 타임아웃 EXIT — 4시간 횡보 시 자금 회전을 위한 시장가 청산
+            #   Guard-B        : 트레일링 스탑 — Peak ROI +15% 터치 후 5% 반납 시 익절 잠금
+            #   Guard-C        : 하드 TP/SL EXIT — 기존 고정 임계치 강제 청산 (하위 호환 유지)
+            # ───────────────────────────────────────────────────────────────────────
             if current_position == "SHORT" and entry_price and last_trade:
                 # 숏 포지션 수익률 (진입가 - 현재가) / 진입가
                 price_return = (entry_price - current_close) / entry_price
@@ -1009,12 +1026,46 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     entry_ts = entry_ts.astimezone(timezone.utc)
                 minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
 
+                # ── [Guard-B] Peak ROI 추적 레지스터 업데이트 ─────────────────────
+                # 매 루프마다 현재 수익률이 과거 최고점을 경신하면 갱신.
+                # price_return이 음수(손실 중)이면 기존 peak 값은 보존됨.
+                _current_peak = _peak_roi_register.get(symbol, Decimal("0"))
+                if price_return > _current_peak:
+                    _peak_roi_register[symbol] = price_return
+                    logger.info(
+                        "📈 [TRAILING_STOP] Peak ROI 신고점 갱신: symbol=%s, peak=%.2f%%, current=%.2f%%",
+                        symbol, float(price_return) * 100, float(price_return) * 100,
+                    )
+                _current_peak = _peak_roi_register.get(symbol, Decimal("0"))
+
                 _hard_trigger: str | None = None
                 _hard_reason: str = ""
 
+                # ── [Guard-A] 타임아웃 EXIT (최우선) ─────────────────────────────
+                # 4시간(240분) 이상 횡보 시 지표 신호 불문 즉시 시장가 청산
                 if minutes_held >= MAX_POSITION_MINUTES:
                     _hard_trigger = "TIMEOUT_EXIT"
-                    _hard_reason  = f"보유 {minutes_held:.0f}분 → 최대 {MAX_POSITION_MINUTES}분 초과"
+                    _hard_reason  = (
+                        f"장기 횡보 타임아웃 — "
+                        f"보유 {minutes_held:.0f}분 → 상한 {MAX_POSITION_MINUTES}분 초과"
+                    )
+
+                # ── [Guard-B] 트레일링 스탑 (타임아웃 미발동 시 검사) ────────────
+                # Peak ROI가 TRAILING_STOP_ACTIVATION_ROI(+15%) 이상 달성된 적 있으며,
+                # 현재 수익률이 고점 대비 TRAILING_STOP_DRAWDOWN(5%) 이상 반납된 순간 발동.
+                elif (
+                    _current_peak >= TRAILING_STOP_ACTIVATION_ROI
+                    and (_current_peak - price_return) >= TRAILING_STOP_DRAWDOWN
+                ):
+                    _hard_trigger = "TRAILING_STOP_EXIT"
+                    _hard_reason  = (
+                        f"익절 보존 가드 발동 — "
+                        f"Peak ROI {float(_current_peak)*100:+.2f}% 달성 후 "
+                        f"현재 {float(price_return)*100:+.2f}%로 "
+                        f"{float(_current_peak - price_return)*100:.2f}% 반납"
+                    )
+
+                # ── [Guard-C] 하드 TP / 하드 SL (기존 로직 하위 호환 유지) ───────
                 elif price_return >= HARD_TP_THRESHOLD:
                     _hard_trigger = "HARD_TP_EXIT"
                     _hard_reason  = f"숏 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
@@ -1024,8 +1075,8 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
                 if _hard_trigger:
                     logger.warning(
-                        "🔔 [%s] 숏 강제 청산 발동: %s (평단=$%s, 현재=$%s)",
-                        _hard_trigger, _hard_reason, entry_price, current_close,
+                        "🔔 [%s] 숏 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
+                        _hard_trigger, _hard_reason, entry_price, current_close, minutes_held,
                     )
                     _hard_amount = Decimal(str(last_trade.amount))
                     if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
@@ -1035,7 +1086,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     _hard_result: OrderResult = _execute_order_pipeline(
                         exchange=exchange,
                         symbol=symbol,
-                        side="BUY",  # 숏 청산
+                        side="BUY",  # 숏 청산 (환매수)
                         amount=_hard_amount,
                         trigger_type=_hard_trigger,
                         fallback_price=current_close,
@@ -1052,17 +1103,52 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         price=_hard_result["filled_price"], amount=_hard_rec_amount,
                         status=_hard_result["status"],
                     ))
-                    # 텔레그램 강제 청산 알림
-                    notifier.send_message(
-                        f"🔔 <b>[QuantFlow] {_hard_trigger} (Short Cover)</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━\n"
-                        f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
-                        f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
-                        f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
-                        f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
-                        f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━"
+
+                    # ── 청산 완료 후 Peak ROI 레지스터 초기화 (다음 포지션에서 재출발) ──
+                    _peak_roi_register.pop(symbol, None)
+                    logger.info(
+                        "🧹 [%s] Peak ROI 레지스터 초기화 완료 (symbol=%s)",
+                        _hard_trigger, symbol,
                     )
+
+                    # ── 가드별 차별화 텔레그램 알림 발송 ─────────────────────────
+                    if _hard_trigger == "TIMEOUT_EXIT":
+                        notifier.send_message(
+                            f"⏱️ <b>[TIMEOUT_EXIT] 장기 횡보로 인한 타임아웃 청산 완료</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
+                    elif _hard_trigger == "TRAILING_STOP_EXIT":
+                        notifier.send_message(
+                            f"📈 <b>[TRAILING_STOP_EXIT] 익절 보존 가드 발동! 수익 잠금 완료</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>최고 수익률(Peak):</b> <code>{float(_current_peak)*100:+.2f}%</code>\n"
+                            f"• <b>청산 시 수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
+                    else:
+                        # Guard-C: 하드 TP/SL 기존 포맷 유지
+                        notifier.send_message(
+                            f"🔔 <b>[QuantFlow] {_hard_trigger} (Short Cover)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
                     return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
 
             # 5. 🎯 [v9.1.0] 하드코딩된 숏(Short) 매매 판단 (Predictor 오버라이드)
@@ -1118,6 +1204,12 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             trigger_type = "SNIPER_SHORT_ENTRY"
             if current_position == "SHORT" and action == "BUY":
                 trigger_type = "REVERSE_SWITCH_EXIT_SHORT"
+
+            # [v9.2] 신규 숏 진입(SELL) 시 Peak ROI 레지스터를 0으로 초기화
+            # — 이전 포지션의 잔류 peak 값이 새 포지션 판단에 오염되는 것을 차단
+            if action == "SELL":
+                _peak_roi_register[symbol] = Decimal("0")
+                logger.info("🔄 [TRAILING_STOP] 새 숏 진입 — Peak ROI 레지스터 초기화: symbol=%s", symbol)
 
             # 동적 주문 수량 연산 (USDT 10% 숏 진입 vs 진입수량 환매수 청산)
             if action == "SELL":

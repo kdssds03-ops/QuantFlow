@@ -13,6 +13,7 @@ Phase 5 (Timezone & Warmup Fix):
   - OHLCV 수집 limit 500봉으로 확대 → EMA50/SMA20 warm-up NaN 원천 차단
 """
 
+import asyncio
 import logging
 import math
 import time
@@ -31,8 +32,12 @@ from tenacity import (
 )
 
 from sqlalchemy import create_engine, desc
+from sqlalchemy.future import select as sa_select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+# ── 비동기 세션 팩토리 (core.database 비동기 엔진 기반) ──────────────────────
+from core.database import async_session as _async_session_factory
 
 from worker.celery_app import celery_app
 from core.config import get_settings
@@ -537,6 +542,107 @@ def _fetch_balance_with_retry(exchange: "ccxt.Exchange") -> dict:
 
 
 # ─────────────────────────────────────────────
+# 🔁 [비동기 DB 헬퍼] 날짜 필터 조회 — async_session 기반
+# ─────────────────────────────────────────────
+async def _async_query_today_trades(symbol: str, start_of_day_naive: datetime) -> list:
+    """
+    비동기 세션(core.database.async_session)을 사용하여 오늘 KST 자정 이후
+    체결된 TradeHistory를 타임스탬프 오름차순으로 조회합니다.
+
+    Celery 동기 태스크에서는 asyncio.run()으로 감싸 호출합니다.
+
+    Args:
+        symbol: 조회할 심볼 (예: "BTC/USDT")
+        start_of_day_naive: KST 자정 기준의 timezone-naive datetime
+
+    Returns:
+        TradeHistory 객체 리스트 (status == 'FILLED', timestamp 오름차순)
+    """
+    async with _async_session_factory() as session:
+        stmt = (
+            sa_select(TradeHistory)
+            .where(
+                TradeHistory.symbol == symbol,
+                TradeHistory.timestamp >= start_of_day_naive,
+                TradeHistory.status == "FILLED",
+            )
+            .order_by(TradeHistory.timestamp.asc())
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+
+async def _async_query_all_filled_sells(symbol: str) -> list:
+    """
+    비동기 세션(core.database.async_session)을 사용하여 해당 심볼의
+    전체 FILLED SELL(숏 진입) 이력을 타임스탬프 오름차순으로 조회합니다.
+
+    generate_daily_report_task()의 Short PnL 계산 로직에서
+    asyncio.run()으로 감싸 호출합니다.
+
+    Args:
+        symbol: 조회할 심볼 (예: "BTC/USDT")
+
+    Returns:
+        TradeHistory 객체 리스트 (side == 'SELL', status == 'FILLED', timestamp 오름차순)
+    """
+    async with _async_session_factory() as session:
+        stmt = (
+            sa_select(TradeHistory)
+            .where(
+                TradeHistory.symbol == symbol,
+                TradeHistory.side   == "SELL",
+                TradeHistory.status == "FILLED",
+            )
+            .order_by(TradeHistory.timestamp.asc())
+        )
+        result = await session.execute(stmt)
+        return result.scalars().all()
+
+
+async def _async_save_trade_history(
+    timestamp: datetime,
+    symbol: str,
+    side: str,
+    price: Decimal,
+    amount: Decimal,
+    status: str,
+) -> None:
+    """
+    TradeHistory 레코드를 비동기 세션(core.database.async_session)으로
+    INSERT·COMMIT 합니다.
+
+    ── 왜 이 헬퍼가 필요한가 ──────────────────────────────────────────────
+    core/database.py 는 asyncpg 기반 완전 비동기 엔진만 제공합니다.
+    Celery 동기 태스크(analyze_and_trade) 내부의 _SyncSession 으로는
+    asyncpg 엔진에 커밋할 수 없어 INSERT 전량이 묵살됩니다.
+
+    이 함수는 ORM 객체를 비동기 세션 컨텍스트 내에서 생성·add·commit 하여
+    세션 종속성 문제(detached-instance error)를 원천 차단합니다.
+    Celery 동기 컨텍스트에서는 asyncio.run()으로 감싸 호출합니다.
+
+    Args:
+        timestamp : 체결 시각 (UTC datetime)
+        symbol    : 거래 심볼 (예: "BTC/USDT")
+        side      : 방향 ("BUY" | "SELL")
+        price     : 체결 단가 (Decimal)
+        amount    : 체결 수량 (Decimal)
+        status    : 주문 상태 ("FILLED" | "PARTIALLY_FILLED" | "REJECTED" | "FAILED" ...)
+    """
+    async with _async_session_factory() as session:
+        record = TradeHistory(
+            timestamp=timestamp,
+            symbol=symbol,
+            side=side,
+            price=price,
+            amount=amount,
+            status=status,
+        )
+        session.add(record)
+        await session.commit()
+
+
+# ─────────────────────────────────────────────
 # 🔄 DB Warm-up: 재시작 시 과거 데이터로 지표 재계산
 # ─────────────────────────────────────────────
 def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
@@ -1004,16 +1110,18 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         usdt_balance=usdt_balance,
                     )
 
-                    # 이력 저장 — 실제 체결 수량/단가 기준으로 칼정산
+                    # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
                     sl_record_amount = sl_result["filled_amount"] if sl_result["filled_amount"] > Decimal("0") else calculated_amount
-                    trade_record = TradeHistory(
-                        timestamp=datetime.now(timezone.utc), symbol=symbol, side="SELL",
-                        price=sl_result["filled_price"], amount=sl_record_amount,
+                    asyncio.run(_async_save_trade_history(
+                        timestamp=datetime.now(timezone.utc),
+                        symbol=symbol,
+                        side="SELL",
+                        price=sl_result["filled_price"],
+                        amount=sl_record_amount,
                         status=sl_result["status"],
-                    )
-                    session.add(trade_record)
+                    ))
                     logger.info(
-                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장: status=%s, order_id=%s",
+                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장 완료 (비동기): status=%s, order_id=%s",
                         sl_result["status"], sl_result["order_id"]
                     )
 
@@ -1113,9 +1221,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         if _hard_result["filled_amount"] > Decimal("0")
                         else _hard_amount
                     )
-                    session.add(TradeHistory(
-                        timestamp=datetime.now(timezone.utc), symbol=symbol, side="BUY",
-                        price=_hard_result["filled_price"], amount=_hard_rec_amount,
+                    # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
+                    asyncio.run(_async_save_trade_history(
+                        timestamp=datetime.now(timezone.utc),
+                        symbol=symbol,
+                        side="BUY",
+                        price=_hard_result["filled_price"],
+                        amount=_hard_rec_amount,
                         status=_hard_result["status"],
                     ))
 
@@ -1266,21 +1378,23 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 usdt_balance=usdt_balance,
             )
 
-            # 이력 저장 — 실제 체결 수량/단가 기준으로 칼정산
+            # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
             # PARTIALLY_FILLED 시 실 체결 수량, 그 외 미체결(CANCELLED/FAILED) 시 요청 수량 기준 기록
             record_amount = (
                 exec_result["filled_amount"]
                 if exec_result["filled_amount"] > Decimal("0")
                 else calculated_amount
             )
-            trade_record = TradeHistory(
-                timestamp=now_utc, symbol=symbol, side=action,
-                price=exec_result["filled_price"], amount=record_amount,
+            asyncio.run(_async_save_trade_history(
+                timestamp=now_utc,
+                symbol=symbol,
+                side=action,
+                price=exec_result["filled_price"],
+                amount=record_amount,
                 status=exec_result["status"],
-            )
-            session.add(trade_record)
+            ))
             logger.info(
-                "🗄️ [%s] DB 이력 저장: status=%s, filled_amount=%s, order_id=%s",
+                "🗄️ [%s] DB 이력 저장 완료 (비동기): status=%s, filled_amount=%s, order_id=%s",
                 trigger_type, exec_result["status"], exec_result["filled_amount"], exec_result["order_id"]
             )
 
@@ -1638,22 +1752,17 @@ def _send_status_brief():
             now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
             
             # ── 오늘 KST 00:00 이후 체결 내역 조회 (타임라인 전용) ───────────────
-            # 🔑 [버그픽스] KST→UTC 변환 오차(9시간 시프트)로 인해 자정 직후 체결 내역이
-            #   누락되는 버그를 방지하기 위해, timezone-naive KST 자정 기준점을 직접 생성하여
-            #   DB의 naive timestamp 컬럼과 직접 비교합니다.
+            # 🔑 [비동기 세션 마이그레이션]
+            #   core.database.async_session 기반 비동기 쿼리로 전환.
+            #   KST→UTC 변환 오차(9시간 시프트) 방지를 위해 timezone-naive KST 자정 기준점을
+            #   직접 생성하여 DB의 naive timestamp 컬럼과 직접 비교합니다.
             _kst_tz = timezone(timedelta(hours=9))
             _now_kst = datetime.now(_kst_tz)
             _start_of_day_naive = datetime(_now_kst.year, _now_kst.month, _now_kst.day, 0, 0, 0)
-            
-            _today_trades = (
-                session.query(TradeHistory)
-                .filter(
-                    TradeHistory.symbol == symbol,
-                    TradeHistory.timestamp >= _start_of_day_naive,
-                    TradeHistory.status == "FILLED",
-                )
-                .order_by(TradeHistory.timestamp)
-                .all()
+
+            # Celery 동기 컨텍스트에서 asyncio.run()으로 비동기 헬퍼 호출
+            _today_trades = asyncio.run(
+                _async_query_today_trades(symbol, _start_of_day_naive)
             )
             
             # ── 타임라인 문자열 생성 ────────────────────────────────────────────
@@ -2007,16 +2116,13 @@ def generate_daily_report_task():
                 pos_emoji = "⚪ FLAT"
 
             # ── [STEP 2] 오늘 KST 00:00 이후 체결된 주문 스캔 ──────────────────
-            # 🔑 [버그픽스] TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → 원본 symbol로 필터,
+            # 🔑 [비동기 세션 마이그레이션]
+            #   core.database.async_session 기반 비동기 쿼리로 전환.
+            #   TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → 원본 symbol로 필터,
             #   로그에는 정규화 키도 함께 기록하여 심볼 포맷 불일치 트러블슈팅을 지원.
-            today_trades = (
-                session.query(TradeHistory)
-                .filter(
-                    TradeHistory.symbol    == symbol,
-                    TradeHistory.timestamp >= start_of_day_naive,
-                )
-                .order_by(TradeHistory.timestamp)
-                .all()
+            # Celery 동기 컨텍스트에서 asyncio.run()으로 비동기 헬퍼 호출
+            today_trades = asyncio.run(
+                _async_query_today_trades(symbol, start_of_day_naive)
             )
             logger.info(
                 "📊 [일일결산] 오늘 거래 스캔: symbol=%s (normalized=%s), start=%s KST(naive), count=%d건",
@@ -2034,15 +2140,9 @@ def generate_daily_report_task():
             #   2. 각 BUY 이전의 SELL(숏 진입) 이력에서 가중 평단가(avg_sell_price) 산출
             #   3. PnL = (avg_sell_price - buy_price) × buy_qty
             #   4. PnL > 0 → 익절(Win), PnL <= 0 → 손절(Loss)
-            all_filled_sells_for_pnl = (
-                session.query(TradeHistory)
-                .filter(
-                    TradeHistory.symbol == symbol,
-                    TradeHistory.side   == "SELL",
-                    TradeHistory.status == "FILLED",
-                )
-                .order_by(TradeHistory.timestamp)
-                .all()
+            # 🔑 [비동기 세션 마이그레이션] — 전체 SELL 이력도 async_session으로 조회
+            all_filled_sells_for_pnl = asyncio.run(
+                _async_query_all_filled_sells(symbol)
             )
 
             today_filled_buys_for_pnl = [

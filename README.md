@@ -64,5 +64,5 @@ cp .env.example .env
 docker compose up -d --build
 
 # 3. 실시간 분산 워커 파이프라인 로그 모니터링
-docker compose logs -f worker beat
+docker compose logs -f worker
 ```

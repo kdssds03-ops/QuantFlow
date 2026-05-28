@@ -997,6 +997,10 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
         now_utc = datetime.now(timezone.utc)
         exchange = get_exchange()
         
+        # [이슈 2 해결] 시간 균열(NTP Drift)로 인한 타임스탬프 거절 방어 이중 Failsafe
+        exchange.options['adjustForTimeDifference'] = True
+        exchange.options['recvWindow'] = 10000
+
         # 1. 실시간 자산 잔고 트래킹 — 3회 자동 재시도 보장 (8차 확장)
         try:
             balance_info = _fetch_balance_with_retry(exchange)
@@ -1346,26 +1350,18 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         )
                     return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
 
-            # 5. 🎯 [v9.1.0] 하드코딩된 숏(Short) 매매 판단 (Predictor 오버라이드)
-            current_rsi = Decimal(str(latest.rsi_14)) if latest.rsi_14 is not None else Decimal("50")
-            current_bb_upper = Decimal(str(latest.bb_upper)) if latest.bb_upper is not None else Decimal("0")
-            current_bb_lower = Decimal(str(latest.bb_lower)) if latest.bb_lower is not None else Decimal("0")
+            # 5. 🎯 Predictor 매매 판단 (동적 타입 가드 적용 및 리턴 규격 불일치 해소)
+            action_result = _predictor.predict(latest)
             
-            action = "HOLD"
-            confidence = 1.0
-            
-            if current_position == "SHORT":
-                # 청산 버퍼 확장: bb_lower 터치 혹은 rsi <= 35
-                if current_close <= current_bb_lower or current_rsi <= Decimal("35"):
-                    logger.info(f"🎯 [v9.1.0] 숏 청산 시그널 발생! Close({current_close}) <= BB_Lower({current_bb_lower}) OR RSI({current_rsi}) <= 35")
-                    action = "BUY"  # 숏 청산(환매수)
+            if isinstance(action_result, dict):
+                action = str(action_result.get("action", action_result.get("status", "HOLD"))).upper()
+                confidence = float(action_result.get("confidence", 1.0))
             else:
-                # 진입 타점 강화: bb_upper 돌파 + rsi >= 73
-                if current_close > current_bb_upper and current_rsi >= Decimal("73"):
-                    logger.info(f"🎯 [v9.1.0] 숏 진입 시그널 발생! Close({current_close}) > BB_Upper({current_bb_upper}) AND RSI({current_rsi}) >= 73")
-                    action = "SELL" # 숏 진입
-
-            if action == "HOLD":
+                action = str(action_result).upper()
+                confidence = 1.0
+            
+            # [이슈 1 해결] 추출된 시그널이 HOLD 거나 HOLD_OR_LOW_CONFIDENCE 인 경우 모두 스킵
+            if action in ("HOLD", "HOLD_OR_LOW_CONFIDENCE"):
                 return {"status": "hold_or_low_confidence", "confidence": confidence}
 
             # 6. 📈 피라미딩(Pyramiding) 매매 로직 (수학적 평단가 방어)

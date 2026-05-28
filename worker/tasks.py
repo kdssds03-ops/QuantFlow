@@ -2028,7 +2028,7 @@ def generate_daily_report_task():
         # 🔑 [버그픽스] KST→UTC 변환 오차(9시간 시프트)로 인해 자정 직후 체결 내역이
         #   누락되는 버그를 방지하기 위해, timezone-naive KST 자정 기준점을 직접 생성하여
         #   DB의 naive timestamp 컬럼과 직접 비교합니다.
-        start_of_day_naive = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0)
+        start_of_day_naive = (now_kst - timedelta(days=1)).replace(tzinfo=None)
         
         # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
@@ -2043,12 +2043,13 @@ def generate_daily_report_task():
         # ── [교착 방지 ②] generate_daily_report 비동기 쿼리 사전 실행 ─────────────
         # for session in _get_sync_session() 외부에서 _run_async_safe()로 미리 조회.
         # 세션 내부에서 asyncio.run() 호출 시 커넥션 경합 Deadlock 유발 원천 차단.
-        today_trades = _run_async_safe(
-            _async_query_today_trades(symbol, start_of_day_naive)
-        )
-        all_filled_sells_for_pnl = _run_async_safe(
-            _async_query_all_filled_sells(symbol)
-        )
+        async def _combined_report_query():
+            return await asyncio.gather(
+                _async_query_today_trades(symbol, start_of_day_naive),
+                _async_query_all_filled_sells(symbol)
+            )
+
+        today_trades, all_filled_sells_for_pnl = _run_async_safe(_combined_report_query())
 
         for session in _get_sync_session():
             latest = session.query(MarketData).filter(

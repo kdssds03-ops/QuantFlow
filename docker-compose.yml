@@ -107,7 +107,7 @@ services:
     command: >
       celery -A worker.celery_app worker
       --loglevel=${LOG_LEVEL:-INFO}
-      --concurrency=2
+      --concurrency=4
       -Q default,trading,market_data
     volumes:
       - .:/opt/quantflow
@@ -116,6 +116,38 @@ services:
       - /opt/quantflow/core/__pycache__
       - /opt/quantflow/worker/__pycache__
       # 호스트 시간대 마운트 (Linux/Mac/WSL)
+      - /etc/localtime:/etc/localtime:ro
+    depends_on:
+      - postgres
+      - redis
+      - api
+
+  # ── [Deadlock 근본 해결] 텔레그램 리스너 전용 워커 ─────────────────
+  # 핵심: concurrency=2 단일 워커가 default+trading+market_data 전담 시,
+  # 2슬롯 전부 매매/데이터 태스크에 점유되면 listener 큐에 슬롯 0개
+  # → telegram_command_listener_task 영구 대기 → /status 읽씩 현상 발생
+  #
+  # 해결썬: listener 큐만 담당하는 전용 워커를 별도 프로세스로 분리하여
+  # 매매 엔진이 얼마나 바비도 텍레그램 리스너는 항상 작동 보장.
+  listener-worker:
+    build: .
+    container_name: qf-listener-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - NUMBA_DISABLE_JIT=1
+    entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
+    command: >
+      celery -A worker.celery_app worker
+      --loglevel=${LOG_LEVEL:-INFO}
+      --concurrency=1
+      -Q listener
+      --hostname=listener@%h
+    volumes:
+      - .:/opt/quantflow
+      - /opt/quantflow/app/__pycache__
+      - /opt/quantflow/core/__pycache__
+      - /opt/quantflow/worker/__pycache__
       - /etc/localtime:/etc/localtime:ro
     depends_on:
       - postgres

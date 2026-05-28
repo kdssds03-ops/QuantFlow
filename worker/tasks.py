@@ -650,6 +650,37 @@ async def _async_save_trade_history(
 
 
 # ─────────────────────────────────────────────
+# 🛡️ [Non-blocking 비동기 격리 래퍼] — asyncio × 동기 세션 교착 원천 차단
+# ─────────────────────────────────────────────
+def _run_async_safe(coro):
+    """
+    Celery 동기 워커(prefork)에서 asyncio 코루틴을 스레드 격리로 안전하게 실행합니다.
+
+    [교착 발생 메커니즘 — 왜 asyncio.run() 직접 호출이 위험한가]
+    asyncio.run()을 _get_sync_session() 컨텍스트 블록 내부에서 직접 호출하면:
+      1. 동기 SQLAlchemy 커넥션이 열린 채로 새 이벤트루프를 생성·실행
+      2. 해당 루프 내 asyncpg 가 PG 비동기 커넥션 풀에서도 커넥션을 요청
+      3. 두 풀이 동시에 경합 → 커넥션 고갈 → 타 태스크(telegram listener) Starvation
+      4. 결과적으로 /status 브리핑이 영구 무응답(읽씹) 상태에 빠짐
+
+    [격리 전략]
+    asyncio.run()을 호출 스레드와 완전히 분리된 전용 스레드에서 실행합니다.
+    호출 스레드의 동기 리소스(DB 세션, Redis 락)는 그대로 유지되며,
+    비동기 I/O는 별도 스레드의 이벤트루프에서 완전히 격리 처리됩니다.
+
+    Args:
+        coro: 실행할 asyncio 코루틴 객체
+    Returns:
+        코루틴의 반환값
+    Raises:
+        concurrent.futures.TimeoutError: 15초 이내 완료되지 않은 경우 (무한 블로킹 방지)
+    """
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
+        return _pool.submit(asyncio.run, coro).result(timeout=15)
+
+
+# ─────────────────────────────────────────────
 # 🔄 DB Warm-up: 재시작 시 과거 데이터로 지표 재계산
 # ─────────────────────────────────────────────
 def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
@@ -1145,9 +1176,10 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         usdt_balance=usdt_balance,
                     )
 
-                    # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
+                    # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
+                    # asyncio.run() 직접 호출 시 동기 세션 홀드 중 커넥션 풀 경합 Deadlock 유발.
                     sl_record_amount = sl_result["filled_amount"] if sl_result["filled_amount"] > Decimal("0") else calculated_amount
-                    asyncio.run(_async_save_trade_history(
+                    _run_async_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
                         side="SELL",
@@ -1156,7 +1188,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         status=sl_result["status"],
                     ))
                     logger.info(
-                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장 완료 (비동기): status=%s, order_id=%s",
+                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장 완료 (스레드 격리 비동기): status=%s, order_id=%s",
                         sl_result["status"], sl_result["order_id"]
                     )
 
@@ -1256,8 +1288,8 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         if _hard_result["filled_amount"] > Decimal("0")
                         else _hard_amount
                     )
-                    # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
-                    asyncio.run(_async_save_trade_history(
+                    # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
+                    _run_async_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
                         side="BUY",
@@ -1413,14 +1445,14 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 usdt_balance=usdt_balance,
             )
 
-            # 이력 저장 — 비동기 INSERT (asyncpg 엔진 호환)
+            # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
             # PARTIALLY_FILLED 시 실 체결 수량, 그 외 미체결(CANCELLED/FAILED) 시 요청 수량 기준 기록
             record_amount = (
                 exec_result["filled_amount"]
                 if exec_result["filled_amount"] > Decimal("0")
                 else calculated_amount
             )
-            asyncio.run(_async_save_trade_history(
+            _run_async_safe(_async_save_trade_history(
                 timestamp=now_utc,
                 symbol=symbol,
                 side=action,
@@ -1429,7 +1461,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 status=exec_result["status"],
             ))
             logger.info(
-                "🗄️ [%s] DB 이력 저장 완료 (비동기): status=%s, filled_amount=%s, order_id=%s",
+                "🗄️ [%s] DB 이력 저장 완료 (스레드 격리 비동기): status=%s, filled_amount=%s, order_id=%s",
                 trigger_type, exec_result["status"], exec_result["filled_amount"], exec_result["order_id"]
             )
 
@@ -1627,10 +1659,10 @@ def daily_report_task():
 def _send_status_brief():
     """
     📊 실시간 시스템 관제 요약 브리핑을 조립하여 텔레그램으로 전송합니다.
+    (비동기 DB 조회 원천 제거, 100% 동기식 API 기반 단일화 완료)
     """
     try:
         exchange = get_exchange()
-        # [모의투자 모드 동기화]
         if getattr(settings, "BINANCE_SANDBOX_MODE", False):
             exchange.set_sandbox_mode(True)
             
@@ -1640,299 +1672,212 @@ def _send_status_brief():
         
         symbol = "BTC/USDT"
         
-        for session in _get_sync_session():
-            latest = session.query(MarketData).filter(
-                MarketData.symbol == symbol
-            ).order_by(desc(MarketData.timestamp)).first()
-            
-            if not latest:
-                notifier.send_message("📊 <b>[QuantFlow 관제 브리핑]</b>\n시스템에 시장 데이터가 존재하지 않습니다.")
-                return
-            
-            current_close = Decimal(str(latest.close))
-            rsi_val = float(latest.rsi_14) if latest.rsi_14 is not None else 0.0
-            bb_upper_val = float(latest.bb_upper) if latest.bb_upper is not None else float(current_close)
-            bb_lower_val = float(latest.bb_lower) if latest.bb_lower is not None else float(current_close)
-            sma_val = float(latest.sma_20) if latest.sma_20 is not None else float(current_close)
+        # ── 1. 시장 지표 조회 (동기식 CCXT API 활용) ──────────────────────────────────
+        current_close = Decimal("0")
+        rsi_val = 0.0
+        bb_upper_val = 0.0
+        bb_lower_val = 0.0
+        sma_val = 0.0
 
-            logger.debug(
-                "📊 [브리핑 디버그] close=%.2f | sma_20=%s | bb_upper=%s | bb_lower=%s | rsi=%.2f",
-                float(current_close),
-                latest.sma_20,
-                latest.bb_upper,
-                latest.bb_lower,
-                rsi_val,
-            )
+        try:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe='15m', limit=30)
+            if ohlcv and len(ohlcv) >= 20:
+                closes = [c[4] for c in ohlcv]
+                current_close = Decimal(str(closes[-1]))
+                
+                # SMA 20 & BB 20
+                recent_20 = closes[-20:]
+                sma = sum(recent_20) / 20.0
+                sma_val = float(sma)
+                variance = sum((x - sma) ** 2 for x in recent_20) / 20.0
+                std_dev = variance ** 0.5
+                bb_upper_val = float(sma + 2 * std_dev)
+                bb_lower_val = float(sma - 2 * std_dev)
+                
+                # 간단한 RMA 기반 RSI 14 산출
+                if len(closes) >= 15:
+                    recent_15 = closes[-15:]
+                    gains, losses = [], []
+                    for i in range(1, 15):
+                        change = recent_15[i] - recent_15[i-1]
+                        if change > 0:
+                            gains.append(change)
+                            losses.append(0)
+                        else:
+                            gains.append(0)
+                            losses.append(abs(change))
+                    avg_gain = sum(gains) / 14.0
+                    avg_loss = sum(losses) / 14.0
+                    if avg_loss == 0:
+                        rsi_val = 100.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsi_val = float(100.0 - (100.0 / (1.0 + rs)))
+            elif ohlcv:
+                current_close = Decimal(str(ohlcv[-1][4]))
+        except Exception as e:
+            logger.warning(f"⚠️ CCXT 지표 계산 실패 (진행은 계속함): {e}")
 
-            # 포지션 분석
-            last_trade = session.query(TradeHistory).filter(
-                TradeHistory.symbol == symbol, TradeHistory.status == "FILLED"
-            ).order_by(desc(TradeHistory.timestamp)).first()
-
-            current_position = "FLAT"
-            entry_price = None
-            pos_pnl_str = ""
-            pos_duration_str = "-"
-
-            # ── [결함 #2 수정] CCXT 실시간 포지션 조회 — Hedge Mode 완전 대응 ───
-            # 바이낸스 Hedge Mode에서는 롱/숏 포지션이 별개 엔트리로 반환됩니다.
-            # 기존 코드의 `contracts > 0` 단순 체크는 이미 청산된(positionAmt=0) 반대편 포지션을
-            # 유효 포지션으로 오인하는 결함이 있었습니다.
-            # 수정 기준:
-            #   ① info.positionAmt (raw 바이낸스 필드) != '0' 인 포지션만 유효 포지션으로 판정
-            #   ② CCXT 통합 필드 positionAmt가 없을 경우 contracts != 0 + side 명시 필터 사용
-            #   ③ 롱/숏 각각 별도 처리하여 방향(side)을 정확하게 추출
-            ccxt_pos = None
-            try:
-                if exchange.has.get('fetchPositions'):
-                    raw_positions = exchange.fetch_positions([symbol])
-                    for p in raw_positions:
-                        # [1순위] 바이낸스 raw info의 positionAmt 필드로 실계약 존재 여부 판정
-                        _raw_info = p.get('info', {})
-                        _pos_amt_raw = _raw_info.get('positionAmt', '0')
-                        try:
-                            _pos_amt_float = float(_pos_amt_raw)
-                        except (TypeError, ValueError):
-                            _pos_amt_float = 0.0
-
-                        if _pos_amt_float == 0.0:
-                            # positionAmt == 0 → 실계약 없음 (이미 청산된 포지션) → 완전 무시
-                            continue
-
-                        # positionAmt != 0 인 포지션만 유효 판정
-                        # CCXT 'side' 필드가 없거나 빈 문자열이면 positionAmt 부호로 방향 보정
-                        _ccxt_side = p.get('side', '').lower()
-                        if not _ccxt_side:
-                            _ccxt_side = 'long' if _pos_amt_float > 0 else 'short'
-
-                        ccxt_pos = p
-                        logger.info(
-                            "📍 [포지션 파싱] Hedge Mode 유효 포지션 감지: side=%s, positionAmt=%s",
-                            _ccxt_side, _pos_amt_raw,
-                        )
+        # ── 2. 단방향(One-Way) 전용 포지션 파싱 ───────────────────────────────────────
+        ccxt_pos = None
+        _one_way_pos_amt = 0.0
+        try:
+            if exchange.has.get('fetchPositions'):
+                _raw_positions = exchange.fetch_positions([symbol])
+                for _p in _raw_positions:
+                    _raw_info_ow = _p.get('info', {})
+                    _pa_raw = _raw_info_ow.get('positionAmt', '0')
+                    try:
+                        _pa_float = float(_pa_raw)
+                    except (TypeError, ValueError):
+                        _pa_float = 0.0
+                    
+                    if abs(_pa_float) > 0.0:
+                        ccxt_pos = _p
+                        _one_way_pos_amt = _pa_float
                         break
-            except Exception as e:
-                logger.warning(f"⚠️ CCXT 포지션 조회 실패 (Fallback to DB): {e}")
+        except Exception as _pos_exc:
+            logger.warning(f"⚠️ CCXT 포지션 조회 실패: {_pos_exc}")
 
-            if ccxt_pos:
-                # CCXT 기준 포지션 파싱 (Hedge Mode 대응 완료)
-                _raw_info     = ccxt_pos.get('info', {})
-                _pos_amt_raw  = _raw_info.get('positionAmt', '0')
-                _pos_amt_float = float(_pos_amt_raw) if _pos_amt_raw else 0.0
+        current_position = "HOLD"
+        entry_price = Decimal("0")
+        pos_duration_str = "-"
+        pos_pnl_str = " (포지션 없음)"
 
-                # 방향: CCXT side 우선, 없으면 positionAmt 부호로 결정
-                side_str = ccxt_pos.get('side', '').lower()
-                if not side_str:
-                    side_str = 'long' if _pos_amt_float > 0 else 'short'
-                current_position = "SHORT" if side_str == 'short' else "LONG"
+        if ccxt_pos:
+            if _one_way_pos_amt > 0:
+                current_position = "LONG"
+            elif _one_way_pos_amt < 0:
+                current_position = "SHORT"
 
-                entry_price = Decimal(str(ccxt_pos.get('entryPrice', 0) or 0))
-                pos_amount  = Decimal(str(abs(_pos_amt_float)))
-
-                # 수익률 계산 (거래소 percentage 우선, 없으면 미실현 손익 / 포지션 가치 기반)
-                _unrealized_raw = float(ccxt_pos.get('unrealizedPnl', 0.0) or 0.0)
-                if ccxt_pos.get('percentage') is not None:
-                    pos_return = float(ccxt_pos['percentage'])
-                elif entry_price > Decimal('0') and pos_amount > Decimal('0'):
-                    _pos_value = float(entry_price * pos_amount)
-                    pos_return = (_unrealized_raw / _pos_value * 100) if _pos_value > 0 else 0.0
-                else:
-                    if current_position == "SHORT" and entry_price > Decimal('0'):
-                        pos_return = float((entry_price - current_close) / entry_price * 100)
-                    elif entry_price > Decimal('0'):
-                        pos_return = float((current_close - entry_price) / entry_price * 100)
-                    else:
-                        pos_return = 0.0
-
-                pos_pnl_str = f" ({pos_return:+.2f}%)"
-
-                # ── 진입 시간 경과: DB의 최근 방향 일치 진입 이력 기준 ─────────────
-                # side == "SELL" (숏 진입) 또는 side == "BUY" (롱 진입) 필터 적용
-                _entry_side_db = "SELL" if current_position == "SHORT" else "BUY"
-                pos_duration_str = "-"
-                last_entry_trade = session.query(TradeHistory).filter(
-                    TradeHistory.symbol == symbol,
-                    TradeHistory.side   == _entry_side_db,
-                    TradeHistory.status == "FILLED",
-                ).order_by(desc(TradeHistory.timestamp)).first()
-                if last_entry_trade:
-                    entry_ts = last_entry_trade.timestamp
-                    if entry_ts.tzinfo is None:
-                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
-                    else:
-                        entry_ts = entry_ts.astimezone(timezone.utc)
+            entry_price = Decimal(str(ccxt_pos.get('entryPrice', 0) or 0))
+            pos_amount  = Decimal(str(abs(_one_way_pos_amt)))
+            
+            _unrealized_raw = float(ccxt_pos.get('unrealizedPnl', 0.0) or 0.0)
+            if ccxt_pos.get('percentage') is not None:
+                pos_return = float(ccxt_pos['percentage'])
+            elif entry_price > Decimal("0") and pos_amount > Decimal("0"):
+                _pos_value = float(entry_price * pos_amount)
+                pos_return = (_unrealized_raw / _pos_value * 100) if _pos_value > 0 else 0.0
+            else:
+                pos_return = 0.0
+            
+            pos_pnl_str = f" ({pos_return:+.2f}%)"
+            
+            # DB 조회가 없으므로 바이낸스 updateTime을 통해 보유 기간을 간접 추정
+            try:
+                _update_time_ms = int(ccxt_pos.get('info', {}).get('updateTime', 0))
+                if _update_time_ms > 0:
+                    entry_ts = datetime.fromtimestamp(_update_time_ms / 1000.0, timezone.utc)
                     minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                    pos_duration_str = f"{minutes_held:.0f}분 보유"
-                    logger.debug(
-                        "📊 [브리핑] CCXT 포지션 경과 시간 계산 완료: entry_ts=%s, minutes=%.1f",
-                        entry_ts.isoformat(), minutes_held,
-                    )
+                    # updateTime은 펀딩비 정산 등에도 갱신될 수 있으므로 (추정) 표기
+                    pos_duration_str = f"{minutes_held:.0f}분 보유 (추정)"
+            except Exception:
+                pass
+
+        # ── 3. 24H 실현 손익 및 Income API 연동 ──────────────────────────────────────
+        _24h_realized_pnl = Decimal("0")
+        _income_commission  = Decimal("0")
+        _income_funding_fee = Decimal("0")
+        _income_api_ok      = False
+        
+        cutoff_24h = datetime.now(timezone.utc) - timedelta(days=1)
+        
+        try:
+            _income_start_ms = int(cutoff_24h.timestamp() * 1000)
+            # 최근 1000건 확보로 PNL, COMMISSION, FUNDING_FEE 모두 커버
+            _income_raw = exchange.fapiPrivateGetIncome(params={
+                "startTime": _income_start_ms,
+                "limit":     1000,
+            })
+            
+            if isinstance(_income_raw, list):
+                for _inc in _income_raw:
+                    try:
+                        _inc_time = int(_inc.get("time", 0) or 0)
+                        if _inc_time < _income_start_ms:
+                            continue
+                            
+                        _inc_type   = str(_inc.get("incomeType", "") or "").upper()
+                        _inc_income = _inc.get("income", None)
+                        if _inc_income is None:
+                            continue
+                        _inc_amount = Decimal(str(_inc_income))
+
+                        if _inc_type == "COMMISSION":
+                            _income_commission += _inc_amount
+                        elif _inc_type == "FUNDING_FEE":
+                            _income_funding_fee += _inc_amount
+                        elif _inc_type == "REALIZED_PNL":
+                            _24h_realized_pnl += _inc_amount
+                    except Exception:
+                        continue
+                _income_api_ok = True
+                logger.info(f"✅ [Income API] 조회 완료 — PNL={_24h_realized_pnl}, COMM={_income_commission}")
             else:
-                # Fallback: DB 기준 로직
-                # 🔑 마지막 체결 방향으로 포지션 상태 추정
-                # SELL = 숏 진입 상태, BUY = 롱 진입 또는 숏 청산 완료
-                if last_trade and last_trade.side == "SELL":
-                    current_position = "SHORT"
-                    entry_price = Decimal(str(last_trade.price))
-                    if entry_price > Decimal('0'):
-                        pos_return = float((entry_price - current_close) / entry_price * 100)
-                    else:
-                        pos_return = 0.0
-                    pos_pnl_str = f" ({pos_return:+.2f}%)"
+                logger.warning(f"⚠️ [Income API] list 아님, type={type(_income_raw)}")
+        except Exception as _income_exc:
+            logger.warning(f"⚠️ [Income API] 조회 실패: {_income_exc}")
 
-                    entry_ts = last_trade.timestamp
-                    if entry_ts.tzinfo is None:
-                        entry_ts = entry_ts.replace(tzinfo=timezone.utc)
-                    else:
-                        entry_ts = entry_ts.astimezone(timezone.utc)
-                    minutes_held = (datetime.now(timezone.utc) - entry_ts).total_seconds() / 60.0
-                    pos_duration_str = f"{minutes_held:.0f}분 보유"
-                    logger.debug(
-                        "📊 [브리핑] DB Fallback 경과 시간 계산 완료: entry_ts=%s, minutes=%.1f",
-                        entry_ts.isoformat(), minutes_held,
-                    )
+        _net_pnl_24h = _24h_realized_pnl + _income_commission + _income_funding_fee
+        
+        _trading_pnl_str  = f"{_24h_realized_pnl:+,.2f} USDT"
+        _commission_str   = f"{_income_commission:+,.2f} USDT" if _income_api_ok else f"{float(_income_commission):.2f} (조회실패)"
+        _funding_fee_str  = f"{_income_funding_fee:+,.2f} USDT" if _income_api_ok else f"{float(_income_funding_fee):.2f} (조회실패)"
+        _net_pnl_str = f"{_net_pnl_24h:+,.2f} USDT"
 
-            # ── [결함 #3 수정] 24H 실현 손익 — Short 전략 기준 확정 손익 계산 ──
-            # 기존 코드: ΣSELL액 − ΣBUY액 → 숏 전략에서 부호가 역전되고
-            #           미결(진입 후 미청산) 포지션의 SELL까지 포함되어 왜곡 발생.
-            #
-            # 수정 로직 (generate_daily_report_task와 동일한 알고리즘으로 통일):
-            #   1. 최근 24시간 내 체결된 BUY(숏 청산) 주문만 확정 손익 기준으로 삼음
-            #   2. 각 BUY 시점 이전의 전체 SELL(숏 진입) 가중 평단가 산출
-            #   3. 확정 PnL = (avg_sell_price - buy_price) × buy_qty
-            #   → 완전히 종료(청산)된 거래만 집계하므로 미결 포지션 오염 없음
-            cutoff_24h = datetime.now(timezone.utc) - timedelta(days=1)
+        # 포지션 이모지
+        if current_position == "SHORT":
+            pos_emoji = "🔴 SHORT"
+        elif current_position == "LONG":
+            pos_emoji = "🟢 LONG"
+        else:
+            pos_emoji = "🟢 HOLD"
+            pos_pnl_str = " (포지션 없음)"
 
-            # 최근 24H 체결 내역 (BUY/SELL 모두)
-            trades_24h = (
-                session.query(TradeHistory)
-                .filter(TradeHistory.timestamp >= cutoff_24h, TradeHistory.status == "FILLED")
-                .all()
-            )
+        kst_tz = timezone(timedelta(hours=9))
+        now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
 
-            # 전체 SELL(숏 진입) 이력 (PnL 계산용 — 24H 기간 제한 없음)
-            all_sells_for_24h_pnl = asyncio.run(
-                _async_query_all_filled_sells(symbol)
-            )
-
-            _24h_realized_pnl = Decimal("0")
-            _24h_buy_trades = [
-                t for t in trades_24h
-                if t.side == "BUY" and t.price is not None and t.amount is not None
-            ]
-            for _bt in _24h_buy_trades:
-                # 해당 BUY 시점 이전 SELL 이력의 가중 평단가 산출
-                _prior_sells = [
-                    s for s in all_sells_for_24h_pnl
-                    if s.timestamp <= _bt.timestamp and s.price is not None and s.amount is not None
-                ]
-                if not _prior_sells:
-                    continue
-                _sum_cost = sum(
-                    Decimal(str(s.price)) * Decimal(str(s.amount)) for s in _prior_sells
-                )
-                _sum_qty = sum(Decimal(str(s.amount)) for s in _prior_sells)
-                if _sum_qty == Decimal("0"):
-                    continue
-                _avg_sell_price = _sum_cost / _sum_qty
-                _buy_price = Decimal(str(_bt.price))
-                _buy_qty   = Decimal(str(_bt.amount))
-                # 숏 확정 PnL: 진입가 > 청산가일수록 이익
-                _24h_realized_pnl += (_avg_sell_price - _buy_price) * _buy_qty
-
-            pnl_24h_str = f"{_24h_realized_pnl:+,.2f} USDT"
-            
-            # 포지션 이모지
-            if current_position == "SHORT":
-                pos_emoji = "🔴 SHORT"
-            elif current_position == "LONG":
-                pos_emoji = "🟢 LONG"
-            else:
-                pos_emoji = "⚪ FLAT"
-            
-            # KST 시간 표기
-            kst_tz = timezone(timedelta(hours=9))
-            now_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
-            
-            # ── 오늘 KST 00:00 이후 체결 내역 조회 (타임라인 전용) ───────────────
-            # 🔑 [비동기 세션 마이그레이션]
-            #   core.database.async_session 기반 비동기 쿼리로 전환.
-            #   KST→UTC 변환 오차(9시간 시프트) 방지를 위해 timezone-naive KST 자정 기준점을
-            #   직접 생성하여 DB의 naive timestamp 컬럼과 직접 비교합니다.
-            _kst_tz = timezone(timedelta(hours=9))
-            _now_kst = datetime.now(_kst_tz)
-            _start_of_day_naive = datetime(_now_kst.year, _now_kst.month, _now_kst.day, 0, 0, 0)
-
-            # Celery 동기 컨텍스트에서 asyncio.run()으로 비동기 헬퍼 호출
-            _today_trades = asyncio.run(
-                _async_query_today_trades(symbol, _start_of_day_naive)
-            )
-            
-            # ── 타임라인 문자열 생성 ────────────────────────────────────────────
-            if _today_trades:
-                _timeline_lines = []
-                for _t in _today_trades:
-                    _ts = _t.timestamp
-                    if _ts.tzinfo is None:
-                        _ts = _ts.replace(tzinfo=timezone.utc)
-                    else:
-                        _ts = _ts.astimezone(timezone.utc)
-                    _ts_kst = _ts.astimezone(_kst_tz)
-                    _time_str = _ts_kst.strftime("%H:%M")
-                    if _t.side == "SELL":
-                        _side_str = "🔴 숏 진입 (or 롱 청산)"
-                    else:
-                        _side_str = "🟢 롱 진입 (or 숏 청산)"
-                    _price_str = f"${float(_t.price):,.2f}" if _t.price else "-"
-                    _qty_str   = f"{float(_t.amount):.6f}" if _t.amount else "-"
-                    _timeline_lines.append(
-                        f"[{_time_str}] {_side_str}\n"
-                        f"  ├ 체결가: <code>{_price_str}</code>\n"
-                        f"  └ 수량:  <code>{_qty_str} BTC</code>"
-                    )
-                _timeline_str = "\n".join(_timeline_lines)
-            else:
-                _timeline_str = "• 오늘 체결된 내역이 없습니다."
-            
-            brief_lines = [
-                "📊 <b>[QuantFlow 실시간 관제 브리핑]</b>",
-                "━━━━━━━━━━━━━━━━━━━━",
-                f"• 🤖 <b>엔진 상태:</b> <code>RUNNING</code>",
-                f"• ⏰ <b>관제 시각:</b> <code>{now_kst}</code>",
-                "",
-                "📦 <b>현재 유지 포지션</b>",
-                "────────────────────",
-                f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
-                f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price else "• <b>평단가:</b> <code>-</code>",
-                # 🔑 [버그픽스] pos_duration_str을 직접 체크하여 경과 시간이 항상 출력되도록 보정.
-                # entry_price 조건이 아닌 pos_duration_str 자체의 유효성을 기준으로 분기합니다.
-                f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>" if (pos_duration_str and pos_duration_str != "-") else "• <b>경과 시간:</b> <code>-</code>",
-                "",
-                "📝 <b>오늘 상세 매매 타임라인</b>",
-                "────────────────────",
-                _timeline_str,
-                "",
-                "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
-                "────────────────────",
-                f"• <b>가용 잔고 (Free):</b> <code>${float(usdt_free):,.2f} USDT</code>",
-                f"• <b>총 자산 (Total):</b> <code>${float(total_assets):,.2f} USDT</code>",
-                f"• <b>24H 실현 손익:</b> <code>{pnl_24h_str}</code>",
-                "",
-                "📈 <b>실시간 시장 지표</b>",
-                "────────────────────",
-                f"• <b>현재가 (Close):</b> <code>${float(current_close):,.2f}</code>",
-                f"• <b>RSI (14주기):</b> <code>{rsi_val:.2f}</code>",
-                f"• <b>볼린저 밴드 상단:</b> <code>${bb_upper_val:,.2f}</code>",
-                f"• <b>볼린저 밴드 하단:</b> <code>${bb_lower_val:,.2f}</code>",
-                f"• <b>SMA (20주기):</b> <code>${sma_val:,.2f}</code>",
-                "━━━━━━━━━━━━━━━━━━━━"
-            ]
-            
-            notifier.send_message("\n".join(brief_lines))
-            logger.info("✅ 텔레그램 '/status' 브리핑 발송 완료")
+        # ── 4. 브리핑 포맷 조립 ─────────────────────────────────────────────────────
+        brief_lines = [
+            "📊 <b>[QuantFlow 실시간 관제 브리핑]</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"• 🤖 <b>엔진 상태:</b> <code>RUNNING</code>",
+            f"• ⏰ <b>관제 시각:</b> <code>{now_kst}</code>",
+            "",
+            "📦 <b>현재 유지 포지션</b>",
+            "────────────────────",
+            f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
+            f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price > Decimal("0") else "• <b>평단가:</b> <code>-</code>",
+            f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>",
+            "",
+            "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
+            "────────────────────",
+            f"• <b>가용 잔고 (Free):</b> <code>${float(usdt_free):,.2f} USDT</code>",
+            f"• <b>총 자산 (Total):</b> <code>${float(total_assets):,.2f} USDT</code>",
+            f"• <b>24H 정산 손익:</b> <code>{_net_pnl_str}</code>",
+            f"  └ 순수 매매손익: <code>{_trading_pnl_str}</code>",
+            f"  └ 누적 수수료:  <code>{_commission_str}</code>",
+            f"  └ 누적 펀딩비:  <code>{_funding_fee_str}</code>",
+            "",
+            "📈 <b>실시간 시장 지표 (API 15m)</b>",
+            "────────────────────",
+            f"• <b>현재가 (Close):</b> <code>${float(current_close):,.2f}</code>",
+            f"• <b>RSI (14주기):</b> <code>{rsi_val:.2f}</code>",
+            f"• <b>볼린저 밴드 상단:</b> <code>${bb_upper_val:,.2f}</code>",
+            f"• <b>볼린저 밴드 하단:</b> <code>${bb_lower_val:,.2f}</code>",
+            f"• <b>SMA (20주기):</b> <code>${sma_val:,.2f}</code>",
+            "━━━━━━━━━━━━━━━━━━━━"
+        ]
+        
+        notifier.send_message("\n".join(brief_lines))
+        logger.info("✅ 텔레그램 '/status' 브리핑 발송 완료 (DB 종속성 100% 제거)")
+        
     except Exception as e:
         logger.error(f"❌ _send_status_brief() 중 에러 발생: {e}", exc_info=True)
-        notifier.send_message(f"❌ <b>[QuantFlow 오류]</b>\n실시간 상태 브리핑 작성 중 실패했습니다: <code>{str(e)}</code>")
+        # 텔레그램 HTML 파싱 에러 방어: str(e)에 포함된 '<', '>' 등의 문자를 이스케이프 처리
+        _safe_err = str(e).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        notifier.send_message(f"❌ <b>[QuantFlow 오류]</b>\n실시간 상태 브리핑 작성 중 실패했습니다: <code>{_safe_err}</code>")
 
 import unicodedata
 import requests
@@ -1978,7 +1923,12 @@ def handle_telegram_command(command: str) -> str:
     return "UNKNOWN_COMMAND"
 
 
-@celery_app.task(name="worker.tasks.telegram_command_listener_task", queue="default")
+@celery_app.task(
+    name="worker.tasks.telegram_command_listener_task",
+    queue="listener",         # 매매/데이터 큐와 워커 슬롯 공유 완전 차단 — 전용 큐 격리
+    soft_time_limit=25,       # 25초 초과 시 SoftTimeLimitExceeded → 즉시 응답 포기 및 종료
+    time_limit=28,            # 28초 절대 하드 킬 (30초 Beat 스케줄 주기 대비 2초 안전 마진)
+)
 def telegram_command_listener_task():
     """
     📥 텔레그램 명령어 수신기 — 30초마다 Celery Beat에 의해 가동.
@@ -2093,7 +2043,17 @@ def generate_daily_report_task():
         symbol = "BTC/USDT"
         # 🔑 정규화된 심볼 (바이낸스 raw 포맷 "BTCUSDT" 매칭용 — 로그 추적에 활용)
         symbol_normalized = _normalize_symbol(symbol)
-        
+
+        # ── [교착 방지 ②] generate_daily_report 비동기 쿼리 사전 실행 ─────────────
+        # for session in _get_sync_session() 외부에서 _run_async_safe()로 미리 조회.
+        # 세션 내부에서 asyncio.run() 호출 시 커넥션 경합 Deadlock 유발 원천 차단.
+        today_trades = _run_async_safe(
+            _async_query_today_trades(symbol, start_of_day_naive)
+        )
+        all_filled_sells_for_pnl = _run_async_safe(
+            _async_query_all_filled_sells(symbol)
+        )
+
         for session in _get_sync_session():
             latest = session.query(MarketData).filter(
                 MarketData.symbol == symbol
@@ -2219,34 +2179,16 @@ def generate_daily_report_task():
                 pos_emoji = "⚪ FLAT"
 
             # ── [STEP 2] 오늘 KST 00:00 이후 체결된 주문 스캔 ──────────────────
-            # 🔑 [비동기 세션 마이그레이션]
-            #   core.database.async_session 기반 비동기 쿼리로 전환.
-            #   TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → 원본 symbol로 필터,
-            #   로그에는 정규화 키도 함께 기록하여 심볼 포맷 불일치 트러블슈팅을 지원.
-            # Celery 동기 컨텍스트에서 asyncio.run()으로 비동기 헬퍼 호출
-            today_trades = asyncio.run(
-                _async_query_today_trades(symbol, start_of_day_naive)
-            )
+            # (today_trades — for session 블록 외부에서 _run_async_safe()로 사전 조회 완료.
+            #  세션 내부 asyncio.run() 재호출 금지 — 커넥션 풀 경합 Deadlock 방지)
             logger.info(
                 "📊 [일일결산] 오늘 거래 스캔: symbol=%s (normalized=%s), start=%s KST(naive), count=%d건",
                 symbol, symbol_normalized, start_of_day_naive.isoformat(), len(today_trades),
             )
 
             # ── [STEP 3] 숏 전략 기반 PnL 계산 ────────────────────────────────
-            # 🔑 [핵심 버그픽스] 기존 코드는 Long 기준(sell - buy)으로 PnL을 계산했으나,
-            #   이 시스템은 Short 전략(SELL 진입 → BUY 청산) 구조입니다.
-            #   올바른 Short PnL = (숏 진입가 - 청산가) × 수량
-            #                   = (avg_sell_price - buy_price) × buy_qty
-            #
-            # 알고리즘:
-            #   1. 오늘 체결된 BUY(숏 청산)를 시간순으로 순회
-            #   2. 각 BUY 이전의 SELL(숏 진입) 이력에서 가중 평단가(avg_sell_price) 산출
-            #   3. PnL = (avg_sell_price - buy_price) × buy_qty
-            #   4. PnL > 0 → 익절(Win), PnL <= 0 → 손절(Loss)
-            # 🔑 [비동기 세션 마이그레이션] — 전체 SELL 이력도 async_session으로 조회
-            all_filled_sells_for_pnl = asyncio.run(
-                _async_query_all_filled_sells(symbol)
-            )
+            # (all_filled_sells_for_pnl — for session 블록 외부에서 _run_async_safe()로 사전 조회 완료)
+            # Short PnL = (숏 진입가 - 청산가) × 수량  =  (avg_sell_price - buy_price) × buy_qty
 
             today_filled_buys_for_pnl = [
                 t for t in today_trades

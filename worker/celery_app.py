@@ -42,7 +42,10 @@ celery_app.conf.update(
         "worker.tasks.check_time_sync_task":  {"queue": "default"},
         "worker.tasks.daily_report_task":     {"queue": "default"},
         "worker.tasks.generate_daily_report_task": {"queue": "default"},
-        "worker.tasks.telegram_command_listener_task": {"queue": "default"},
+        # [Deadlock 근본 차단] 텔레그램 리스너 전용 큐 분리
+        # trading/market_data/default 워커와 슬롯 공유 완전 차단
+        # → /status 명령은 매매 진행 여부 무관, 항상 즉시 슬롯 확보 보장
+        "worker.tasks.telegram_command_listener_task": {"queue": "listener"},
     },
 )
 
@@ -89,10 +92,12 @@ celery_app.conf.beat_schedule = {
         "options": {"queue": "default"},
     },
 
-    # ── 30초마다 텔레그램 명령어 수신 ────────
+    # ── 30초마다 텍레그램 명령어 수신 (전용 격리 큐) ────
     "telegram-command-listener": {
         "task": "worker.tasks.telegram_command_listener_task",
         "schedule": 30.0,
-        "options": {"queue": "default"},
+        # ⇒ listener 큐: 매매/데이터 태스크와 워커 슬롯 공유 원체 차단
+        # ⇒ /status 명령은 매매 진행여부 무관하게 항상 즉시 응답 보장
+        "options": {"queue": "listener"},
     },
 }

@@ -848,18 +848,8 @@ async def _async_save_trade_history(
 def _run_async_safe(coro):
     """
     Celery 동기 워커(prefork)에서 asyncio 코루틴을 스레드 격리로 안전하게 실행합니다.
-
-    [교착 발생 메커니즘 — 왜 asyncio.run() 직접 호출이 위험한가]
-    asyncio.run()을 _get_sync_session() 컨텍스트 블록 내부에서 직접 호출하면:
-      1. 동기 SQLAlchemy 커넥션이 열린 채로 새 이벤트루프를 생성·실행
-      2. 해당 루프 내 asyncpg 가 PG 비동기 커넥션 풀에서도 커넥션을 요청
-      3. 두 풀이 동시에 경합 → 커넥션 고갈 → 타 태스크(telegram listener) Starvation
-      4. 결과적으로 /status 브리핑이 영구 무응답(읽씹) 상태에 빠짐
-
-    [격리 전략]
-    asyncio.run()을 호출 스레드와 완전히 분리된 전용 스레드에서 실행합니다.
-    호출 스레드의 동기 리소스(DB 세션, Redis 락)는 그대로 유지되며,
-    비동기 I/O는 별도 스레드의 이벤트루프에서 완전히 격리 처리됩니다.
+    매 실행마다 독립된 이벤트 루프 수명 주기를 보장하여 'Event loop is closed' 및
+    'attached to a different loop' 에러를 완벽하게 차단합니다.
 
     Args:
         coro: 실행할 asyncio 코루틴 객체
@@ -869,8 +859,39 @@ def _run_async_safe(coro):
         concurrent.futures.TimeoutError: 15초 이내 완료되지 않은 경우 (무한 블로킹 방지)
     """
     import concurrent.futures
+
+    def _execute_in_isolated_loop(c):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = None
+
+        is_new_loop = False
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            is_new_loop = True
+
+        try:
+            return loop.run_until_complete(c)
+        finally:
+            if is_new_loop:
+                try:
+                    # 루프 내 미완료/대기 중인 태스크들 정리
+                    try:
+                        pending = asyncio.all_tasks(loop)
+                        if pending:
+                            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    except Exception:
+                        pass
+                    loop.close()
+                except Exception as close_exc:
+                    logger.warning(f"⚠️ [비동기 격리] 독립 루프 정리 실패: {close_exc}")
+                finally:
+                    asyncio.set_event_loop(None)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _pool:
-        return _pool.submit(asyncio.run, coro).result(timeout=15)
+        return _pool.submit(_execute_in_isolated_loop, coro).result(timeout=15)
 
 
 # ─────────────────────────────────────────────

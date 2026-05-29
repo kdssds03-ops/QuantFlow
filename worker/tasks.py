@@ -2142,7 +2142,7 @@ def generate_daily_report_task():
         # 🔑 [버그픽스] KST→UTC 변환 오차(9시간 시프트)로 인해 자정 직후 체결 내역이
         #   누락되는 버그를 방지하기 위해, timezone-naive KST 자정 기준점을 직접 생성하여
         #   DB의 naive timestamp 컬럼과 직접 비교합니다.
-        start_of_day_naive = (now_kst - timedelta(days=1)).replace(tzinfo=None)
+        start_of_day_naive = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0)
         
         # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
@@ -2173,38 +2173,74 @@ def generate_daily_report_task():
             current_close = Decimal(str(latest.close)) if latest else Decimal("0")
             total_assets = usdt_balance + (btc_balance * current_close)
             
-            # ── [STEP 1] CCXT fetch_positions 실시간 교차 검증 (1순위) ───────────
-            # 🔑 [핵심 버그픽스] DB 쿼리에만 의존하지 않고 거래소 실제 포지션을 1순위로 참조.
-            # _send_status_brief()와 동일한 방식 — CCXT 실패 시에만 DB Fallback 전환.
+            # ── [STEP 1] CCXT positionAmt 기반 원격 API 단일 포지션 판정 파이프라인 ───
+            # 🔑 [v10 전면 고도화] DB Fallback을 완전히 배제하고, 원격 API의 positionAmt 부호만을
+            #   절대 진실로 삼아 포지션을 판정합니다. DB 이력 역산 방식은 청산 이력 누락 시
+            #   과거 포지션(SHORT)이 잔류하는 동기화 유실 결함을 유발하므로 완전 소각합니다.
+            #   positionAmt > 0 → LONG / < 0 → SHORT / == 0 또는 데이터 없음 → FLAT
             current_position  = "FLAT"
+            pos_emoji         = "⚪ FLAT"
             entry_price       = None
             pos_pnl_str       = ""
             pos_duration_str  = "-"
             unrealized_pnl    = Decimal("0")
+            unrealized_pnl_str = ""
             ccxt_pos          = None
+            _pos_amt_float    = 0.0
 
             try:
                 if exchange.has.get("fetchPositions"):
-                    positions = exchange.fetch_positions([symbol])
-                    for p in positions:
-                        if p.get("contracts") and float(p["contracts"]) > 0:
-                            ccxt_pos = p
-                            break
+                    _raw_positions = exchange.fetch_positions([symbol])
+                    for _p in _raw_positions:
+                        # positionAmt: 바이낸스 단방향(One-Way) 모드의 실제 보유량 부호값
+                        _raw_info     = _p.get("info", {})
+                        _pa_raw       = _raw_info.get("positionAmt", "0")
+                        try:
+                            _pa_float = float(_pa_raw)
+                        except (TypeError, ValueError):
+                            _pa_float = 0.0
+
+                        if abs(_pa_float) > 0.0:
+                            ccxt_pos       = _p
+                            _pos_amt_float = _pa_float
+                            break  # 활성 포지션 확보 즉시 탈출
+
+                logger.info(
+                    "📊 [일일결산] CCXT positionAmt 조회 완료 — positionAmt=%.6f, ccxt_pos=%s",
+                    _pos_amt_float, "확보" if ccxt_pos else "없음(FLAT)",
+                )
             except Exception as _pos_exc:
                 logger.warning(
-                    "⚠️ [일일결산] CCXT fetch_positions 실패 → DB Fallback 전환: %s", _pos_exc
+                    "⚠️ [일일결산] CCXT fetch_positions 실패 → FLAT으로 안전 처리 (DB Fallback 없음): %s",
+                    _pos_exc,
                 )
 
-            if ccxt_pos:
-                # ── CCXT 기준 포지션 파싱 ────────────────────────────────────
-                side_str         = ccxt_pos.get("side", "").lower()
-                current_position = "SHORT" if side_str == "short" else "LONG"
-                entry_price      = Decimal(str(ccxt_pos.get("entryPrice", 0) or 0))
-                pos_amount       = Decimal(str(ccxt_pos.get("contracts", 0) or 0))
-                _unrealized_raw  = ccxt_pos.get("unrealizedPnl", 0.0) or 0.0
-                unrealized_pnl   = Decimal(str(_unrealized_raw))
+            # ── positionAmt 부호 기반 포지션 방향 확정 ─────────────────────────
+            if ccxt_pos is not None and _pos_amt_float > 0.0:
+                current_position = "LONG"
+                pos_emoji        = "🟢 LONG"
+            elif ccxt_pos is not None and _pos_amt_float < 0.0:
+                current_position = "SHORT"
+                pos_emoji        = "🔴 SHORT"
+            else:
+                # positionAmt == 0 이거나 데이터 자체가 없음 → 완전 FLAT
+                current_position   = "FLAT"
+                pos_emoji          = "⚪ FLAT"
+                entry_price        = None
+                pos_pnl_str        = ""
+                pos_duration_str   = "-"
+                unrealized_pnl     = Decimal("0")
+                unrealized_pnl_str = ""
+                logger.info("📊 [일일결산] 포지션 없음(FLAT) 확정 — 포지션 상세 필드 초기화 완료")
 
-                # 수익률 계산 (거래소 percentage 우선, 없으면 직접 계산)
+            # ── 활성 포지션(LONG/SHORT)일 때만 상세 지표 파싱 ──────────────────
+            if current_position in ("LONG", "SHORT") and ccxt_pos is not None:
+                entry_price     = Decimal(str(ccxt_pos.get("entryPrice", 0) or 0))
+                pos_amount      = Decimal(str(abs(_pos_amt_float)))  # 절대값으로 수량 확보
+                _unrealized_raw = ccxt_pos.get("unrealizedPnl", 0.0) or 0.0
+                unrealized_pnl  = Decimal(str(_unrealized_raw))
+
+                # 수익률 계산 (거래소 percentage 우선, 없으면 unrealizedPnl/포지션가치 비율)
                 if ccxt_pos.get("percentage") is not None:
                     pos_return = float(ccxt_pos["percentage"])
                 elif entry_price > Decimal("0") and pos_amount > Decimal("0"):
@@ -2220,17 +2256,21 @@ def generate_daily_report_task():
 
                 pos_pnl_str = f" ({pos_return:+.2f}%)"
 
-                # 진입 시간: DB에서 가장 최근 SELL(숏 진입) 이력 기준
-                # 🔑 [버그픽스] side == "SELL" 필터로 청산(BUY) 이후에도 올바른 진입 시각 참조.
-                #   TradeHistory.symbol은 "BTC/USDT" 포맷으로 저장 → DB 조회는 원본 symbol 사용.
-                last_sell_for_duration = session.query(TradeHistory).filter(
+                # 미실현 손익 문자열 생성
+                _upnl_sign         = "+" if unrealized_pnl >= Decimal("0") else ""
+                unrealized_pnl_str = f"{_upnl_sign}{float(unrealized_pnl):,.2f} USDT"
+
+                # 경과 시간: DB 진입 이력에서 최근 체결 시각을 참조 (API에 updateTime 없을 때 보조)
+                # SHORT: 가장 최근 SELL(숏 진입) 기준 / LONG: 가장 최근 BUY(롱 진입) 기준
+                _entry_side_filter = "SELL" if current_position == "SHORT" else "BUY"
+                _last_entry_trade  = session.query(TradeHistory).filter(
                     TradeHistory.symbol == symbol,
-                    TradeHistory.side   == "SELL",
+                    TradeHistory.side   == _entry_side_filter,
                     TradeHistory.status == "FILLED",
                 ).order_by(desc(TradeHistory.timestamp)).first()
 
-                if last_sell_for_duration:
-                    _ets = last_sell_for_duration.timestamp
+                if _last_entry_trade:
+                    _ets = _last_entry_trade.timestamp
                     if _ets.tzinfo is None:
                         _ets = _ets.replace(tzinfo=timezone.utc)
                     else:
@@ -2238,56 +2278,9 @@ def generate_daily_report_task():
                     _mins = (datetime.now(timezone.utc) - _ets).total_seconds() / 60.0
                     pos_duration_str = f"{_mins:.0f}분 보유"
                     logger.info(
-                        "📊 [일일결산] CCXT 포지션 경과 시간 확정: %.0f분 (entry_ts=%s)",
-                        _mins, _ets.isoformat(),
+                        "📊 [일일결산] 포지션 경과 시간 확정: %.0f분 (side=%s, entry_ts=%s)",
+                        _mins, _entry_side_filter, _ets.isoformat(),
                     )
-
-            else:
-                # ── DB Fallback: CCXT 조회 실패 시 ─────────────────────────────
-                # 🔑 [핵심 버그픽스] 기존에는 side == "BUY" → LONG 만 처리하여 SHORT 포지션을
-                #   영구적으로 FLAT 출력하는 치명적 결함이 있었음. SHORT(SELL) 케이스 추가.
-                last_trade_db = session.query(TradeHistory).filter(
-                    TradeHistory.symbol == symbol,
-                    TradeHistory.status == "FILLED",
-                ).order_by(desc(TradeHistory.timestamp)).first()
-
-                if last_trade_db:
-                    _entry_price_db = Decimal(str(last_trade_db.price))
-                    _ets = last_trade_db.timestamp
-                    if _ets.tzinfo is None:
-                        _ets = _ets.replace(tzinfo=timezone.utc)
-                    else:
-                        _ets = _ets.astimezone(timezone.utc)
-                    _mins = (datetime.now(timezone.utc) - _ets).total_seconds() / 60.0
-
-                    if last_trade_db.side == "SELL":
-                        # 숏 포지션 (SHORT) — 가격 하락 시 수익
-                        current_position = "SHORT"
-                        entry_price      = _entry_price_db
-                        if entry_price > Decimal("0"):
-                            pos_return = float((entry_price - current_close) / entry_price * 100)
-                        else:
-                            pos_return = 0.0
-                        pos_pnl_str      = f" ({pos_return:+.2f}%)"
-                        pos_duration_str = f"{_mins:.0f}분 보유"
-                    elif last_trade_db.side == "BUY":
-                        # 롱 포지션 (LONG) — 가격 상승 시 수익
-                        current_position = "LONG"
-                        entry_price      = _entry_price_db
-                        if entry_price > Decimal("0"):
-                            pos_return = float((current_close - entry_price) / entry_price * 100)
-                        else:
-                            pos_return = 0.0
-                        pos_pnl_str      = f" ({pos_return:+.2f}%)"
-                        pos_duration_str = f"{_mins:.0f}분 보유"
-
-            # 포지션 이모지
-            if current_position == "SHORT":
-                pos_emoji = "🔴 SHORT"
-            elif current_position == "LONG":
-                pos_emoji = "🟢 LONG"
-            else:
-                pos_emoji = "⚪ FLAT"
 
             # ── [STEP 2] 오늘 KST 00:00 이후 체결된 주문 스캔 ──────────────────
             # (today_trades — for session 블록 외부에서 _run_async_safe()로 사전 조회 완료.
@@ -2364,11 +2357,6 @@ def generate_daily_report_task():
                 pnl_emoji = "➖"
                 pnl_sign  = ""
 
-            # 미실현 손익 표기 (CCXT 포지션이 있을 때만 표시)
-            unrealized_pnl_str = ""
-            if current_position != "FLAT" and ccxt_pos is not None:
-                _upnl_sign = "+" if unrealized_pnl >= Decimal("0") else ""
-                unrealized_pnl_str = f"{_upnl_sign}{float(unrealized_pnl):,.2f} USDT"
 
             report_time_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
 

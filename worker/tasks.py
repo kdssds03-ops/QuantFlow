@@ -663,6 +663,84 @@ def _fetch_balance_with_retry(exchange: "ccxt.Exchange") -> dict:
     raise last_exc or RuntimeError("fetch_balance 알 수 없는 실패")
 
 
+def _get_futures_margin_balance(exchange: "ccxt.Exchange") -> tuple[Decimal, Decimal]:
+    """
+    선물 지갑의 마진 잔고를 정밀 조회하는 헬퍼 함수.
+    [선물 지갑 마진 잔고(totalMarginBalance) + 현물 지갑의 BTC 잔고 가치(BTC 수량 × 현재 시장가)]를
+    모두 합산한 '통합 총자산'을 계산하여 반환하여 status 및 trading engine 간 일치성을 보장합니다.
+    
+    Returns:
+        tuple[Decimal, Decimal]: (통합 총자산(USDT), 가용 마진 잔고(USDT))
+    """
+    balance_info = _fetch_balance_with_retry(exchange)
+    
+    # 기본값 (Fallback)
+    total_margin = Decimal(str(balance_info["total"].get("USDT", 0.0)))
+    free_margin = Decimal(str(balance_info["free"].get("USDT", 0.0)))
+    
+    try:
+        # 바이낸스 원시 info 객체에서 totalMarginBalance 최우선 참조
+        raw_info = balance_info.get("info", {})
+        if "totalMarginBalance" in raw_info:
+            total_margin = Decimal(str(raw_info["totalMarginBalance"]))
+        if "availableBalance" in raw_info:
+            free_margin = Decimal(str(raw_info["availableBalance"]))
+    except Exception as e:
+        logger.warning(f"⚠️ [Margin Balance] 원시 info 객체 파싱 실패, Fallback 적용: {e}")
+
+    # ── [결함 #1 해결] 현물 지갑 내 BTC 잔고 체크 및 실시간 가치 통합 ─────────
+    spot_btc = Decimal("0")
+    try:
+        # CCXT fetch_balance에서 type='spot'으로 현물 잔고 조회
+        spot_bal = exchange.fetch_balance({"type": "spot"})
+        if spot_bal:
+            if "total" in spot_bal and "BTC" in spot_bal["total"]:
+                spot_btc = Decimal(str(spot_bal["total"]["BTC"]))
+            elif "BTC" in spot_bal:
+                if isinstance(spot_bal["BTC"], dict):
+                    spot_btc = Decimal(str(spot_bal["BTC"].get("total", 0.0)))
+                else:
+                    spot_btc = Decimal(str(spot_bal["BTC"]))
+    except Exception as spot_exc:
+        logger.warning(f"⚠️ [BTC 현물 잔고 조회] 실패 (무시하고 0.0 처리): {spot_exc}")
+
+    if spot_btc > Decimal("0"):
+        btc_price = Decimal("0")
+        # 1순위: WebSocket 인메모리 큐 최신가 참조 (0ms 지연)
+        try:
+            if _ohlcv_stream:
+                key = _ohlcv_stream._normalize("BTC/USDT")
+                q = _ohlcv_stream._queues.get(key)
+                if q and len(q) > 0:
+                    btc_price = Decimal(str(q[-1][4]))  # index 4 is close price
+                    logger.info(f"⚡ [BTC 실시간 시세] WebSocket 인메모리 큐 최신가 참조 성공: {btc_price} USDT")
+        except Exception as ws_err:
+            logger.warning(f"⚠️ [BTC 실시간 시세] WebSocket 큐 조회 실패: {ws_err}")
+
+        # 2순위 Fallback: ccxt.fetch_ticker REST API
+        if btc_price <= Decimal("0"):
+            try:
+                ticker = exchange.fetch_ticker("BTC/USDT")
+                btc_price = Decimal(str(ticker["last"]))
+                logger.info(f"📡 [BTC 실시간 시세] ccxt.fetch_ticker REST API 조회 성공: {btc_price} USDT")
+            except Exception as rest_err:
+                logger.error(f"❌ [BTC 실시간 시세] fetch_ticker REST API 최종 실패: {rest_err}")
+
+        # 실시간 가치 정밀 합산 (Decimal)
+        if btc_price > Decimal("0"):
+            spot_btc_value = spot_btc * btc_price
+            total_margin += spot_btc_value
+            logger.info(
+                f"💰 [통합 자산 합산 성공] 선물 마진 잔고: {total_margin - spot_btc_value} USDT + "
+                f"현물 BTC 잔고 가치: {spot_btc_value} USDT ({spot_btc} BTC × {btc_price} USDT) "
+                f"→ 통합 총자산: {total_margin} USDT"
+            )
+        else:
+            logger.warning("⚠️ [통합 자산 합산] BTC 시세를 획득하지 못해 현물 자산 합산을 스킵합니다.")
+        
+    return total_margin, free_margin
+
+
 # ─────────────────────────────────────────────
 # 🔁 [비동기 DB 헬퍼] 날짜 필터 조회 — async_session 기반
 # ─────────────────────────────────────────────
@@ -1136,10 +1214,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
         # 1. 실시간 자산 잔고 트래킹 — 3회 자동 재시도 보장 (8차 확장)
         try:
-            balance_info = _fetch_balance_with_retry(exchange)
-            usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
-            usdt_free    = Decimal(str(balance_info["free"].get("USDT", 0.0)))
-            btc_free     = Decimal(str(balance_info["free"].get("BTC", 0.0)))
+            usdt_balance, usdt_free = _get_futures_margin_balance(exchange)
         except Exception as e:
             logger.error("❌ 실시간 지갑 잔고 조회 최종 실패 (%d회 재시도 소진): %s", _BALANCE_RETRY_MAX, e)
             return {"status": "balance_fetch_failed"}
@@ -1776,55 +1851,110 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         float(_long_roi) * 100,
                     )
 
-            # 7. ⚡ 주문 분기점 정의 (신규 숏 진입 vs 숏 청산) 및 동적 주문 수량 계산
-            trigger_type = "SNIPER_SHORT_ENTRY"
-            if current_position == "SHORT" and action == "BUY":
-                trigger_type = "REVERSE_SWITCH_EXIT_SHORT"
+            # 7. ⚡ 주문 분기점 정의 및 동적 주문 수량 계산 (Symmetric LONG & SHORT Pipeline)
+            RISK_FACTOR = Decimal("0.1")  # 기본 진입 비중 (10%)
+            _step = _get_lot_size_step(exchange, symbol, fallback_step="0.001")
+            
+            # 0 나눗셈 및 math.isnan 방어 가드
+            if current_close is None or current_close <= Decimal("0") or math.isnan(float(current_close)):
+                logger.error("❌ [매매 파이프라인] 현재가(current_close)가 비정상(0, None 또는 NaN)이므로 주문을 생성할 수 없습니다.")
+                return {"status": "invalid_current_close"}
 
-            # [v9.2] 신규 숏 진입(SELL) 시 Peak ROI 레지스터를 0으로 초기화
-            # — 이전 포지션의 잔류 peak 값이 새 포지션 판단에 오염되는 것을 차단
-            # 🔑 정규화된 키로 초기화하여 바이낸스 raw 심볼과의 KeyMismatch 방지
-            # [Phase 6] 신규 LONG 진입(BUY) 시 불타기 카운터 Redis 리셋
+            # 가용 마진(Available_Margin) 안전 검증
+            if usdt_free is None or usdt_free < Decimal("0") or math.isnan(float(usdt_free)):
+                logger.error("❌ [매매 파이프라인] 가용 마진(usdt_free)이 비정상(None 또는 NaN)이므로 주문을 생성할 수 없습니다.")
+                return {"status": "invalid_usdt_free"}
+
+            calculated_amount = Decimal("0")
+            trigger_type = "HOLD"
+
             if action == "SELL":
-                _peak_roi_register[_normalize_symbol(symbol)] = Decimal("0")
-                logger.info(
-                    "🔄 [TRAILING_STOP] 새 숏 진입 — Peak ROI 레지스터 초기화: symbol=%s (key=%s)",
-                    symbol, _normalize_symbol(symbol),
-                )
-            if action == "BUY" and current_position != "LONG":
-                # 신규 LONG 진입 시 불타기 카운터 초기화 (이전 포지션 잔류 방지)
-                try:
-                    _r_reset = _sync_redis_lib.Redis.from_url(
-                        settings.redis_url, decode_responses=True, socket_connect_timeout=2
-                    )
-                    _r_reset.delete(f"{_PYRAMID_COUNT_KEY_PREFIX}{_normalize_symbol(symbol)}")
+                if current_position == "LONG":
+                    # 롱 포지션 청산 (스위칭)
+                    trigger_type = "REVERSE_SWITCH_EXIT_LONG"
+                    calculated_amount = pos_contracts
+                    logger.info(f"💰 [자산 배분 - 롱 청산] API 포지션 절대 수량 기준 전량 청산: {calculated_amount} BTC")
+                elif current_position == "FLAT":
+                    # 신규 숏 진입
+                    trigger_type = "SNIPER_SHORT_ENTRY"
+                    raw_amount = (usdt_free * RISK_FACTOR) / current_close
+                    # 0.001 미만으로 내려앉지 않도록 최소 안전장치 (최소 수량 하한선 0.001 BTC 설정)
+                    if raw_amount < Decimal("0.001"):
+                        logger.warning(
+                            "⚠️ [수량 산출 - 숏 진입] 계산된 수량(%s BTC)이 최소 하한선 0.001 BTC 미만이므로, 안전장치를 가동하여 0.001 BTC로 상향 조정합니다.",
+                            raw_amount
+                        )
+                        raw_amount = Decimal("0.001")
+                    
+                    # [v9.2] 신규 숏 진입(SELL) 시 Peak ROI 레지스터를 0으로 초기화
+                    # — 이전 포지션의 잔류 peak 값이 새 포지션 판단에 오염되는 것을 차단
+                    # 🔑 정규화된 키로 초기화하여 바이낸스 raw 심볼과의 KeyMismatch 방지
+                    _peak_roi_register[_normalize_symbol(symbol)] = Decimal("0")
                     logger.info(
-                        "🔄 [불타기 엔진] 신규 LONG 진입 — 불타기 카운터 초기화: %s",
-                        _normalize_symbol(symbol),
+                        "🔄 [TRAILING_STOP] 새 숏 진입 — Peak ROI 레지스터 초기화: symbol=%s (key=%s)",
+                        symbol, _normalize_symbol(symbol),
                     )
-                except Exception as _reset_exc:
-                    logger.warning("⚠️ [불타기 엔진] 카운터 초기화 실패 (무시): %s", _reset_exc)
 
-            # 동적 주문 수량 연산 (USDT 10% 숏 진입 vs 진입수량 환매수 청산)
-            if action == "SELL":
-                # 가용 USDT의 10%만큼 숏 진입 수량 계산
-                target_usdt = usdt_free * Decimal("0.1")
-                calculated_amount = target_usdt / current_close
-                logger.info(f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표: {target_usdt} USDT -> 계산 수량: {calculated_amount} BTC")
+                    # 거래소 stepSize 버림 처리
+                    quantized = _quantize_amount(raw_amount, _step, min_order=Decimal("0.001"))
+                    calculated_amount = quantized if quantized is not None else Decimal("0")
+                    logger.info(
+                        f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표 (10%): {usdt_free * RISK_FACTOR} USDT -> "
+                        f"계산 수량: {raw_amount} BTC -> stepSize({_step}) 적용 최종 수량: {calculated_amount} BTC"
+                    )
+                else:
+                    trigger_type = "ALREADY_IN_SHORT_HOLD"
+                    calculated_amount = Decimal("0")
+                    logger.info("⏸️  [자산 배분 - 숏 진입] 이미 숏 포지션 보유 중이므로 신규 진입을 무시합니다.")
+
             elif action == "BUY":
-                # 숏 청산: API 원격 포지션 절대 수량(pos_contracts)으로 전량 환매수.
-                # 구형 DB last_trade.amount 참조를 완전히 대체.
-                # FLAT 상태에서 BUY 시그널 발생 시 pos_contracts == 0 → 수량 미달 Short-circuit.
-                calculated_amount = pos_contracts
-                logger.info(f"💰 [자산 배분 - 숏 청산] API 포지션 절대 수량 기준 전량 청산: {calculated_amount} BTC")
-            else:
-                calculated_amount = Decimal("0")
+                if current_position == "SHORT":
+                    # 숏 포지션 청산 (스위칭)
+                    trigger_type = "REVERSE_SWITCH_EXIT_SHORT"
+                    calculated_amount = pos_contracts
+                    logger.info(f"💰 [자산 배분 - 숏 청산] API 포지션 절대 수량 기준 전량 청산: {calculated_amount} BTC")
+                elif current_position == "FLAT":
+                    # 신규 롱 진입
+                    trigger_type = "SNIPER_LONG_ENTRY"
+                    raw_amount = (usdt_free * RISK_FACTOR) / current_close
+                    # 0.001 미만으로 내려앉지 않도록 최소 안전장치 (최소 수량 하한선 0.001 BTC 설정)
+                    if raw_amount < Decimal("0.001"):
+                        logger.warning(
+                            "⚠️ [수량 산출 - 롱 진입] 계산된 수량(%s BTC)이 최소 하한선 0.001 BTC 미만이므로, 안전장치를 가동하여 0.001 BTC로 상향 조정합니다.",
+                            raw_amount
+                        )
+                        raw_amount = Decimal("0.001")
+                    
+                    # [Phase 6] 신규 LONG 진입(BUY) 시 불타기 카운터 Redis 리셋
+                    try:
+                        _r_reset = _sync_redis_lib.Redis.from_url(
+                            settings.redis_url, decode_responses=True, socket_connect_timeout=2
+                        )
+                        _r_reset.delete(f"{_PYRAMID_COUNT_KEY_PREFIX}{_normalize_symbol(symbol)}")
+                        logger.info(
+                            "🔄 [불타기 엔진] 신규 LONG 진입 — 불타기 카운터 초기화: %s",
+                            _normalize_symbol(symbol),
+                        )
+                    except Exception as _reset_exc:
+                        logger.warning("⚠️ [불타기 엔진] 카운터 초기화 실패 (무시): %s", _reset_exc)
 
-            # 방어적 검증 (Short-circuit): 수량 부족 시 주문 취소 및 조기 리턴
-            if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
+                    # 거래소 stepSize 버림 처리
+                    quantized = _quantize_amount(raw_amount, _step, min_order=Decimal("0.001"))
+                    calculated_amount = quantized if quantized is not None else Decimal("0")
+                    logger.info(
+                        f"💰 [자산 배분 - 롱 진입] 가용 USDT: {usdt_free} -> 진입 목표 (10%): {usdt_free * RISK_FACTOR} USDT -> "
+                        f"계산 수량: {raw_amount} BTC -> stepSize({_step}) 적용 최종 수량: {calculated_amount} BTC"
+                    )
+                else:
+                    trigger_type = "ALREADY_IN_LONG_HOLD"
+                    calculated_amount = Decimal("0")
+                    logger.info("⏸️  [자산 배분 - 롱 진입] 이미 롱 포지션 보유 중이므로 신규 진입을 무시합니다.")
+
+            # 방어적 검증 (Short-circuit): 수량 부족 시 주문 취소 및 조기 리턴 (최소 0.001 BTC)
+            if calculated_amount <= Decimal("0") or calculated_amount < Decimal("0.001"):
                 logger.warning(
                     f"⏸️  [{trigger_type}] 계산된 주문 수량이 부족하여 주문 생략: "
-                    f"수량={calculated_amount}, 최소 필요={MIN_ORDER_BTC}"
+                    f"수량={calculated_amount}, 최소 필요=0.001"
                 )
                 return {"status": "insufficient_calculated_amount"}
 
@@ -2063,9 +2193,7 @@ def _send_status_brief():
         if getattr(settings, "BINANCE_SANDBOX_MODE", False):
             exchange.set_sandbox_mode(True)
             
-        balance_info = _fetch_balance_with_retry(exchange)
-        usdt_free = Decimal(str(balance_info["free"].get("USDT", 0.0)))
-        total_assets = Decimal(str(balance_info["total"].get("USDT", 0.0)))
+        total_assets, usdt_free = _get_futures_margin_balance(exchange)
         
         symbol = "BTC/USDT"
         
@@ -2433,9 +2561,7 @@ def generate_daily_report_task():
         
         # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
-        balance_info = _fetch_balance_with_retry(exchange)
-        usdt_balance = Decimal(str(balance_info["total"].get("USDT", 0.0)))
-        btc_balance  = Decimal(str(balance_info["total"].get("BTC", 0.0)))
+        usdt_balance, _ = _get_futures_margin_balance(exchange)
         
         symbol = "BTC/USDT"
         # 🔑 정규화된 심볼 (바이낸스 raw 포맷 "BTCUSDT" 매칭용 — 로그 추적에 활용)
@@ -2458,7 +2584,7 @@ def generate_daily_report_task():
             ).order_by(desc(MarketData.timestamp)).first()
             
             current_close = Decimal(str(latest.close)) if latest else Decimal("0")
-            total_assets = usdt_balance + (btc_balance * current_close)
+            total_assets = usdt_balance
             
             # ── [STEP 1] CCXT positionAmt 기반 원격 API 단일 포지션 판정 파이프라인 ───
             # 🔑 [v10 전면 고도화] DB Fallback을 완전히 배제하고, 원격 API의 positionAmt 부호만을

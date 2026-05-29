@@ -1141,14 +1141,107 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 
             current_close = Decimal(str(latest.close))
 
-            # 3. 가장 최근 체결 주문 기반 실시간 숏 포지션(SHORT/FLAT) 상태 분석
-            last_trade = session.query(TradeHistory).filter(TradeHistory.symbol == symbol, TradeHistory.status == "FILLED").order_by(desc(TradeHistory.timestamp)).first()
-            
-            current_position = "FLAT"
-            entry_price = None
-            if last_trade and last_trade.side == "SELL":
-                current_position = "SHORT"
-                entry_price = Decimal(str(last_trade.price))
+            # ─────────────────────────────────────────────────────────────────
+            # 3. 🛡️ [수석 아키텍트 명세 #2] 포지션 판정 파이프라인 — 100% 원격 API 기반
+            # ─────────────────────────────────────────────────────────────────
+            # 구형 로직(로컬 TradeHistory DB 조회 → last_trade.side 비교) 완전 소각.
+            # 바이낸스 선물 원격 API에서 실제 positionAmt를 직접 조회·파싱하여 판정.
+            #
+            # [단방향(One-Way) 포지션 파싱 규칙 — 수석 아키텍트 명세 #2]
+            #   positionAmt > 0  →  current_position = "LONG"
+            #   positionAmt < 0  →  current_position = "SHORT"
+            #   positionAmt == 0 →  current_position = "FLAT"
+            #
+            # [entryPrice 연동 — 수석 아키텍트 명세 #3]
+            #   entry_price = Decimal(str(pos.get('entryPrice', 0)))
+            #   API 응답에서 직접 추출하여 로컬 DB 참조를 완전히 대체.
+            #
+            # [pos_contracts — 청산 수량 결정]
+            #   abs(positionAmt) 값으로 환매수/청산 주문 수량을 결정.
+            #   DB last_trade.amount 참조를 완전히 대체.
+            # ─────────────────────────────────────────────────────────────────
+            current_position: str = "FLAT"
+            entry_price: Decimal | None = None
+            pos_contracts: Decimal = Decimal("0")  # 포지션 절대 수량 (청산 시 사용)
+            _api_pos_raw: dict = {}                # API info 원본 응답 (updateTime 추출용)
+
+            try:
+                # ── [1순위] CCXT fetch_positions 추상화 레이어 시도 ──────────
+                # exchange.fetch_positions([symbol]) — Binance USDM Futures 기준
+                # 내부적으로 fapiPrivateGetPositionRisk 를 호출하여 통합 응답 반환.
+                if exchange.has.get("fetchPositions"):
+                    _raw_positions = exchange.fetch_positions([symbol])
+                    for _p in _raw_positions:
+                        # positionAmt는 CCXT 표준화 필드가 아닌 바이낸스 raw 필드이므로
+                        # info 딕셔너리에서 직접 추출하여 float 안전 변환 수행.
+                        _info = _p.get("info", {})
+                        _pa_raw = _info.get("positionAmt", "0")
+                        try:
+                            _pa_float = float(_pa_raw)
+                        except (TypeError, ValueError):
+                            _pa_float = 0.0
+
+                        # 단방향(One-Way) 포지션 판정: positionAmt 부호로 방향 결정
+                        if _pa_float > 0.0:
+                            current_position = "LONG"
+                            entry_price      = Decimal(str(_p.get("entryPrice", 0) or 0))
+                            pos_contracts    = Decimal(str(abs(_pa_float)))
+                            _api_pos_raw     = _info
+                            break
+                        elif _pa_float < 0.0:
+                            current_position = "SHORT"
+                            entry_price      = Decimal(str(_p.get("entryPrice", 0) or 0))
+                            pos_contracts    = Decimal(str(abs(_pa_float)))
+                            _api_pos_raw     = _info
+                            break
+                        # _pa_float == 0.0 → 이 심볼 포지션 없음(FLAT), 루프 계속
+
+                else:
+                    # ── [2순위 Fallback] fapiPrivateGetPositionRisk 직접 호출 ──
+                    # fetchPositions 미지원 환경 또는 CCXT 버전 호환 이슈 시 사용.
+                    _symbol_no_slash = _normalize_symbol(symbol)  # "BTC/USDT" → "BTCUSDT"
+                    _pos_risk_list = exchange.fapiPrivateGetPositionRisk(
+                        params={"symbol": _symbol_no_slash}
+                    )
+                    if isinstance(_pos_risk_list, list):
+                        for _pr in _pos_risk_list:
+                            _pa_raw = _pr.get("positionAmt", "0")
+                            try:
+                                _pa_float = float(_pa_raw)
+                            except (TypeError, ValueError):
+                                _pa_float = 0.0
+
+                            if _pa_float > 0.0:
+                                current_position = "LONG"
+                                entry_price      = Decimal(str(_pr.get("entryPrice", 0) or 0))
+                                pos_contracts    = Decimal(str(abs(_pa_float)))
+                                _api_pos_raw     = _pr
+                                break
+                            elif _pa_float < 0.0:
+                                current_position = "SHORT"
+                                entry_price      = Decimal(str(_pr.get("entryPrice", 0) or 0))
+                                pos_contracts    = Decimal(str(abs(_pa_float)))
+                                _api_pos_raw     = _pr
+                                break
+
+                logger.info(
+                    "📡 [포지션 판정 - API 완료] symbol=%s → position=%s, "
+                    "entryPrice=%s, posAmt=%s, positionAmt_raw=%s",
+                    symbol, current_position,
+                    str(entry_price), str(pos_contracts),
+                    _api_pos_raw.get("positionAmt", "N/A"),
+                )
+
+            except Exception as _pos_api_exc:
+                # API 조회 실패 시 안전하게 FLAT 처리 → 신규 진입/추가 주문 봉쇄.
+                # (포지션 불명 상태에서 추가 진입은 자산 위험을 배가시킬 수 있음)
+                logger.error(
+                    "🚨 [포지션 판정 - API 실패] 원격 포지션 조회 실패 → FLAT 보수 처리 (신규 주문 봉쇄): %s",
+                    _pos_api_exc, exc_info=True,
+                )
+                current_position = "FLAT"
+                entry_price      = None
+                pos_contracts    = Decimal("0")
 
             # 4. 🛡️ [손절 방패 (우선순위 1위)] 리스크 관리 작동 검사
             if current_position == "SHORT" and entry_price:
@@ -1157,8 +1250,10 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 if price_return <= STOP_LOSS_THRESHOLD:
                     logger.warning(f"🚨 [손절 방패 가동] 평단가: {entry_price} -> 현재가: {current_close} ({price_return*100:.2f}%)")
                     
-                    # [동적 수량 계산 - 손절 청산]: 숏 진입 시 수량만큼 환매수(BUY)
-                    calculated_amount = Decimal(str(last_trade.amount))
+                    # [동적 수량 계산 - 손절 청산]
+                    # API에서 받은 실제 포지션 절대 수량(pos_contracts)으로 환매수(BUY).
+                    # 구형 DB last_trade.amount 참조를 완전히 대체.
+                    calculated_amount = pos_contracts
                     
                     # 방어적 검증 (Short-circuit): 최소 주문 수량 미만 검사
                     if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
@@ -1205,18 +1300,32 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             #   Guard-B        : 트레일링 스탑 — Peak ROI +15% 터치 후 5% 반납 시 익절 잠금
             #   Guard-C        : 하드 TP/SL EXIT — 기존 고정 임계치 강제 청산 (하위 호환 유지)
             # ───────────────────────────────────────────────────────────────────────
-            if current_position == "SHORT" and entry_price and last_trade:
+            if current_position == "SHORT" and entry_price:
                 # 숏 포지션 수익률 (진입가 - 현재가) / 진입가
                 price_return = (entry_price - current_close) / entry_price
                 now_utc_check = datetime.now(timezone.utc)
 
-                # 진입 시각 타임존 정규화
-                entry_ts = last_trade.timestamp
-                if entry_ts.tzinfo is None:
-                    entry_ts = entry_ts.replace(tzinfo=timezone.utc)
+                # 진입 시각: API updateTime 필드에서 추출하여 보유 기간 산출.
+                # _api_pos_raw['updateTime'] — 바이낸스 포지션 마지막 업데이트 밀리초 타임스탬프.
+                # 구형 DB last_trade.timestamp 참조를 완전히 대체.
+                entry_ts: datetime | None = None
+                try:
+                    _update_time_ms = int(_api_pos_raw.get("updateTime", 0) or 0)
+                    if _update_time_ms > 0:
+                        entry_ts = datetime.fromtimestamp(
+                            _update_time_ms / 1000.0, tz=timezone.utc
+                        )
+                except Exception as _ts_exc:
+                    logger.warning("⚠️ [포지션 진입 시각] updateTime 파싱 실패: %s", _ts_exc)
+
+                if entry_ts is not None:
+                    minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
                 else:
-                    entry_ts = entry_ts.astimezone(timezone.utc)
-                minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
+                    # updateTime 파싱 실패 시 타임아웃 가드를 비활성화 (0분 처리)
+                    minutes_held = 0.0
+                    logger.warning(
+                        "⚠️ [포지션 보유 시간] updateTime 없음 → 타임아웃 가드 비활성화 (이번 턴 스킵)"
+                    )
 
                 # ── [Guard-B] Peak ROI 추적 레지스터 업데이트 ─────────────────────
                 # 매 루프마다 현재 수익률이 과거 최고점을 경신하면 갱신.
@@ -1236,8 +1345,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 _hard_reason: str = ""
 
                 # ── [Guard-A] 타임아웃 EXIT (최우선) ─────────────────────────────
-                # 4시간(240분) 이상 횡보 시 지표 신호 불문 즉시 시장가 청산
-                if minutes_held >= MAX_POSITION_MINUTES:
+                # 4시간(240분) 이상 횡보 시 지표 신호 불문 즉시 시장가 청산.
+                # entry_ts가 유효한 경우에만 발동 (updateTime 파싱 실패 시 비활성화).
+                if entry_ts is not None and minutes_held >= MAX_POSITION_MINUTES:
                     _hard_trigger = "TIMEOUT_EXIT"
                     _hard_reason  = (
                         f"장기 횡보 타임아웃 — "
@@ -1272,7 +1382,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         "🔔 [%s] 숏 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
                         _hard_trigger, _hard_reason, entry_price, current_close, minutes_held,
                     )
-                    _hard_amount = Decimal(str(last_trade.amount))
+                    # 청산 수량: API에서 받은 포지션 절대 수량(pos_contracts) 사용.
+                    # 구형 DB last_trade.amount 참조를 완전히 대체.
+                    _hard_amount = pos_contracts
                     if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
                         logger.warning("[%s] 숏 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
                         return {"status": "insufficient_amount_for_hard_exit"}
@@ -1413,9 +1525,11 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 calculated_amount = target_usdt / current_close
                 logger.info(f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표: {target_usdt} USDT -> 계산 수량: {calculated_amount} BTC")
             elif action == "BUY":
-                # 숏 청산 시 진입했던 수량만큼 환매수
-                calculated_amount = Decimal(str(last_trade.amount)) if last_trade else Decimal("0")
-                logger.info(f"💰 [자산 배분 - 숏 청산] 보유 숏 전량 청산: {calculated_amount} BTC")
+                # 숏 청산: API 원격 포지션 절대 수량(pos_contracts)으로 전량 환매수.
+                # 구형 DB last_trade.amount 참조를 완전히 대체.
+                # FLAT 상태에서 BUY 시그널 발생 시 pos_contracts == 0 → 수량 미달 Short-circuit.
+                calculated_amount = pos_contracts
+                logger.info(f"💰 [자산 배분 - 숏 청산] API 포지션 절대 수량 기준 전량 청산: {calculated_amount} BTC")
             else:
                 calculated_amount = Decimal("0")
 

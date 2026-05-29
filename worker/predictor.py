@@ -11,6 +11,14 @@ Phase 4: MLPredictor 고도화 및 다중 기술적 지표 알고리즘 탑재
 Phase 5 (Timezone & NaN Fix):
   - MLPredictor DB 조회 시 UTC timestamp 기준 정렬 적용 (타임존 혼재 방지)
   - RuleBasedPredictor NaN 감지 로직 강화 및 WARNING 로그 금액화
+
+Phase 6 (Aggressive Hybrid Strategy):
+  - 래리 윌리엄스 변동성 돌파(Volatility Breakout) 룰셋 통합
+    · Target_Price = 오늘시가 + (전일고가 - 전일저가) × 0.5
+    · 현재가가 Target_Price 돌파 + 거래량 동반 시 신뢰도 +0.2 가중치
+  - 동적 확신도 임계치(Dynamic Confidence Threshold)
+    · 기본값 0.65 유지
+    · 거래량 급등(현재 > 20봉 평균) 또는 RSI(14) 40~60 강한 추세 구간 → 0.55 자동 하향
 """
 
 import logging
@@ -101,6 +109,11 @@ class RuleBasedPredictor(BasePredictor):
       - BB 이탈 깊이 + RSI 극단도 가중 평균 기반 신뢰도(Confidence) 산출
       - MLPredictor 장애 시 자동 폴백 방패 역할
 
+    Phase 6 고도화 (공격형 하이브리드):
+      - 래리 윌리엄스 변동성 돌파(Volatility Breakout) 필터 내장
+        · BUY 시그널 확정 후 변동성 돌파 조건 동시 충족 시 신뢰도 +0.2 추가 가중치
+        · 조건: current_close > (open + (prev_high - prev_low) × 0.5) AND volume 동반
+
     매매 전략 원리:
     - BUY (매수): 종가(close) <= 볼린저 밴드 하단(bb_lower) 이고 RSI(rsi_14) <= 30
     - SELL (매도): 종가(close) >= 볼린저 밴드 상단(bb_upper) 이고 RSI(rsi_14) >= 70
@@ -153,6 +166,7 @@ class RuleBasedPredictor(BasePredictor):
           기본 신뢰도 0.70 (양대 조건 동시 충족 시)
           + BB 이탈 깊이 보너스 (최대 +0.125)
           + RSI 극단도 보너스 (최대 +0.125)
+          + [Phase 6] 변동성 돌파 보너스 +0.20 (래리 윌리엄스 룰셋 — BUY 확정 후 추가 적용)
           → 합산 최대 0.95 캡
 
         Args:
@@ -168,10 +182,15 @@ class RuleBasedPredictor(BasePredictor):
                 return market_data.get(attr_name)
             return getattr(market_data, attr_name, None)
 
-        close_raw = _get_val("close")
-        rsi_raw = _get_val("rsi_14")
+        close_raw    = _get_val("close")
+        rsi_raw      = _get_val("rsi_14")
         bb_upper_raw = _get_val("bb_upper")
         bb_lower_raw = _get_val("bb_lower")
+        # [Phase 6] 변동성 돌파 룰셋에 필요한 추가 지표
+        open_raw     = _get_val("open")
+        volume_raw   = _get_val("volume")
+        high_raw     = _get_val("high")
+        low_raw      = _get_val("low")
 
         raw_indicators = {
             "close": close_raw,
@@ -198,8 +217,8 @@ class RuleBasedPredictor(BasePredictor):
 
         # 3. 부동소수점 오차 방지를 위한 Decimal 타입 변환 및 정밀성 보장
         try:
-            close = Decimal(str(close_raw))
-            rsi_14 = Decimal(str(rsi_raw))
+            close    = Decimal(str(close_raw))
+            rsi_14   = Decimal(str(rsi_raw))
             bb_upper = Decimal(str(bb_upper_raw))
             bb_lower = Decimal(str(bb_lower_raw))
         except (ValueError, TypeError, InvalidOperation) as exc:
@@ -217,6 +236,42 @@ class RuleBasedPredictor(BasePredictor):
             )
             return "HOLD", 0.0
 
+        # [Phase 6] 변동성 돌파 판정 헬퍼 —————————————————————————————————————
+        # 래리 윌리엄스 룰: Target_Price = 오늘시가 + (전일고가 - 전일저가) × 0.5
+        # 현재가 > Target_Price AND 거래량 동반 → 추세 초입 강력 매수 가중치 +0.20
+        # 지표가 없으면(None/NaN/0) 안전하게 False 처리하여 기존 로직에 영향 없음.
+        def _check_volatility_breakout() -> bool:
+            """래리 윌리엄스 변동성 돌파 조건 판정 (True=돌파 확인)"""
+            try:
+                if open_raw is None or high_raw is None or low_raw is None or volume_raw is None:
+                    return False
+                _open   = Decimal(str(open_raw))
+                _high   = Decimal(str(high_raw))
+                _low    = Decimal(str(low_raw))
+                _volume = Decimal(str(volume_raw))
+                # 유효성 체크
+                if _open.is_nan() or _high.is_nan() or _low.is_nan() or _volume.is_nan():
+                    return False
+                if _volume <= Decimal("0"):
+                    return False
+                # Target_Price 계산 (전일 범위를 현재 캔들 H-L로 근사)
+                _day_range = _high - _low
+                if _day_range <= Decimal("0"):
+                    return False
+                _target_price = _open + _day_range * Decimal("0.5")
+                # 현재가가 Target_Price 돌파했는지 판정
+                if close > _target_price:
+                    logger.info(
+                        "🚀 [VB_BREAKOUT] 변동성 돌파 확인! "
+                        "Close=%.2f > Target=%.2f (Open=%.2f, Range=%.2f)",
+                        float(close), float(_target_price),
+                        float(_open), float(_day_range),
+                    )
+                    return True
+                return False
+            except (ValueError, TypeError, InvalidOperation):
+                return False
+
         # 4. 볼린저 밴드 + RSI 조합 매매 전략 수행 (신뢰도 산출 포함)
         bb_width = bb_upper - bb_lower
 
@@ -233,6 +288,15 @@ class RuleBasedPredictor(BasePredictor):
             confidence = min(
                 0.70 + (bb_penetration + rsi_extremity) * 0.125, 0.95
             )
+            # [Phase 6] 변동성 돌파 보너스 +0.20 (최대 0.95 캡 적용)
+            _vb_bonus = 0.0
+            if _check_volatility_breakout():
+                _vb_bonus = 0.20
+                logger.info(
+                    "🔥 [RuleBasedPredictor] 변동성 돌파 보너스 적용! BUY 신뢰도 %.4f → %.4f",
+                    confidence, min(confidence + _vb_bonus, 0.95),
+                )
+            confidence = min(confidence + _vb_bonus, 0.95)
             logger.info(
                 f"🟢 [RuleBasedPredictor] BUY 시그널 발생! "
                 f"(Close: {close} <= BB_Lower: {bb_lower}) AND (RSI: {rsi_14} <= {self.RSI_OVERSOLD}) "
@@ -768,13 +832,93 @@ class MLPredictor(BasePredictor):
                 len(rows),
             )
 
-            # ── STEP 9: 신뢰도 가드라인 (65% 미만 → HOLD) ──────────────
-            if signal != "HOLD" and confidence < self._confidence_threshold:
+            # ── STEP 9: [Phase 6] 동적 확신도 임계치 산출 ───────────────
+            # 기본값: self._confidence_threshold (0.65)
+            # 완화 조건(어느 하나라도 충족 시 → 0.55 하향):
+            #   [A] 현재 거래량 > 직전 20봉 평균 거래량 (Volume Surge)
+            #   [B] RSI(14) 40~60 구간 (강한 추세 진행 중)
+            # Decimal 정밀도 준수 및 NaN 방어 내장.
+            _effective_threshold = self._confidence_threshold  # 기본 0.65
+            try:
+                _rsi_val = float(last_row.get("rsi_14", 50.0))
+                _vol_val = float(last_row.get("volume", 0.0))
+
+                # [A] 거래량 급등 판정: 직전 20봉 평균 거래량과 비교
+                _vol_surge = False
+                if len(df) >= 21 and not math.isnan(_vol_val) and _vol_val > 0:
+                    _recent_vols = [
+                        float(v) for v in df["volume"].iloc[-21:-1].values
+                        if not math.isnan(float(v))
+                    ]
+                    if _recent_vols:
+                        _avg_vol = sum(_recent_vols) / len(_recent_vols)
+                        if _avg_vol > 0 and _vol_val > _avg_vol:
+                            _vol_surge = True
+                            logger.info(
+                                "⚡ [DYN_THRESHOLD] 거래량 급등 감지 — "
+                                "현재 Vol=%.2f > 20봉 평균=%.2f → 임계치 0.65→0.55",
+                                _vol_val, _avg_vol,
+                            )
+
+                # [B] RSI 40~60 강한 추세 구간 판정
+                _rsi_trend_zone = (
+                    not math.isnan(_rsi_val)
+                    and 40.0 <= _rsi_val <= 60.0
+                )
+                if _rsi_trend_zone and not _vol_surge:
+                    logger.info(
+                        "⚡ [DYN_THRESHOLD] RSI 추세 구간 감지 — "
+                        "RSI=%.1f (40~60) → 임계치 0.65→0.55",
+                        _rsi_val,
+                    )
+
+                if _vol_surge or _rsi_trend_zone:
+                    _effective_threshold = 0.55
+
+            except Exception as _thr_exc:
+                # 임계치 산출 실패 시 기본값(0.65) 유지 — 기존 안전 로직 보존
+                logger.warning(
+                    "⚠️ [DYN_THRESHOLD] 동적 임계치 산출 실패 → 기본값 %.2f 유지: %s",
+                    self._confidence_threshold, _thr_exc,
+                )
+
+            # ── STEP 9-B: [Phase 6] 변동성 돌파 보너스 +0.20 (래리 윌리엄스) ──
+            # ML 추론 결과가 BUY이고, 래리 윌리엄스 변동성 돌파 조건 충족 시
+            # 신뢰도에 +0.20 무조건 추가 (최대 0.99 캡, sanity guard 이전 단계).
+            _vb_bonus = 0.0
+            if signal == "BUY":
+                try:
+                    _open_val   = float(last_row.get("open",   float("nan")))
+                    _high_val   = float(last_row.get("high",   float("nan")))
+                    _low_val    = float(last_row.get("low",    float("nan")))
+                    _close_val  = float(last_row.get("close",  float("nan")))
+                    _vol_vb     = float(last_row.get("volume", 0.0))
+                    if not any(math.isnan(v) for v in (_open_val, _high_val, _low_val, _close_val)):
+                        _day_range    = _high_val - _low_val
+                        _target_price = _open_val + _day_range * 0.5
+                        if _day_range > 0 and _close_val > _target_price and _vol_vb > 0:
+                            _vb_bonus = 0.20
+                            logger.info(
+                                "🔥 [VB_BREAKOUT/ML] 변동성 돌파 보너스 적용! "
+                                "BUY 신뢰도 %.4f → %.4f "
+                                "(Close=%.2f > Target=%.2f)",
+                                confidence, min(confidence + _vb_bonus, 0.99),
+                                _close_val, _target_price,
+                            )
+                except Exception as _vb_exc:
+                    logger.warning(
+                        "⚠️ [VB_BREAKOUT/ML] 변동성 돌파 판정 중 예외 → 보너스 미적용: %s",
+                        _vb_exc,
+                    )
+            confidence = min(confidence + _vb_bonus, 0.99)
+
+            # ── STEP 9-C: 유효 임계치 기반 신뢰도 가드 ─────────────────
+            if signal != "HOLD" and confidence < _effective_threshold:
                 logger.info(
-                    "🛡️ [MLPredictor] 신뢰도 가드: %.2f%% < %.2f%% "
+                    "🛡️ [MLPredictor] 신뢰도 가드: %.2f%% < %.2f%% (유효 임계치) "
                     "→ HOLD 필터링 (뇌동매매 방지)",
                     confidence * 100,
-                    self._confidence_threshold * 100,
+                    _effective_threshold * 100,
                 )
                 return "HOLD", confidence
 

@@ -1256,9 +1256,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 _df_hist = pd.DataFrame([
                     {
                         "timestamp_ms": int(
-                            (_r.timestamp.astimezone(timezone.utc)
-                             if _r.timestamp.tzinfo else
-                             _r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
+                            _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
+                            if _r.timestamp.tzinfo else
+                            _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
                         ),
                         "open":   float(_r.open),
                         "high":   float(_r.high),

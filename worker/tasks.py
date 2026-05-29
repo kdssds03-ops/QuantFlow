@@ -2561,8 +2561,23 @@ def generate_daily_report_task():
         
         # ── 실시간 자산 및 시세 조회 ──────────────────────────────────────────
         exchange = get_exchange()
-        usdt_balance, _ = _get_futures_margin_balance(exchange)
+        total_assets_val, usdt_free_val = _get_futures_margin_balance(exchange)
         
+        # 🔑 [결함 #3 해결] VS Code undefined btc_balance 경고 제거 및 실시간 현물 BTC 조회
+        btc_balance = Decimal("0")
+        try:
+            spot_bal = exchange.fetch_balance({"type": "spot"})
+            if spot_bal:
+                if "total" in spot_bal and "BTC" in spot_bal["total"]:
+                    btc_balance = Decimal(str(spot_bal["total"]["BTC"]))
+                elif "BTC" in spot_bal:
+                    if isinstance(spot_bal["BTC"], dict):
+                        btc_balance = Decimal(str(spot_bal["BTC"].get("total", 0.0)))
+                    else:
+                        btc_balance = Decimal(str(spot_bal["BTC"]))
+        except Exception as spot_exc:
+            logger.warning(f"⚠️ [일일결산] 현물 BTC 잔고 조회 실패 (0.0 처리): {spot_exc}")
+
         symbol = "BTC/USDT"
         # 🔑 정규화된 심볼 (바이낸스 raw 포맷 "BTCUSDT" 매칭용 — 로그 추적에 활용)
         symbol_normalized = _normalize_symbol(symbol)
@@ -2584,7 +2599,8 @@ def generate_daily_report_task():
             ).order_by(desc(MarketData.timestamp)).first()
             
             current_close = Decimal(str(latest.close)) if latest else Decimal("0")
-            total_assets = usdt_balance
+            total_assets = total_assets_val
+            usdt_balance = usdt_free_val
             
             # ── [STEP 1] CCXT positionAmt 기반 원격 API 단일 포지션 판정 파이프라인 ───
             # 🔑 [v10 전면 고도화] DB Fallback을 완전히 배제하고, 원격 API의 positionAmt 부호만을

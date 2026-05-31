@@ -9,6 +9,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import DeclarativeBase
 
+from sqlalchemy.pool import NullPool
+
 from core.config import get_settings
 
 settings = get_settings()
@@ -17,9 +19,7 @@ settings = get_settings()
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
+    poolclass=NullPool,
 )
 
 # ── Session Factory ──────────────────────────

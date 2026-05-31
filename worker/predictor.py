@@ -238,10 +238,14 @@ class RuleBasedPredictor(BasePredictor):
 
         # [Phase 6] 변동성 돌파 판정 헬퍼 —————————————————————————————————————
         # 래리 윌리엄스 룰: Target_Price = 오늘시가 + (전일고가 - 전일저가) × 0.5
-        # 현재가 > Target_Price AND 거래량 동반 → 추세 초입 강력 매수 가중치 +0.20
+        # 현재가 > Target_Price AND 거래량 동반 → 추세 초입 강력 매수 가중치 +0.10
         # 지표가 없으면(None/NaN/0) 안전하게 False 처리하여 기존 로직에 영향 없음.
         def _check_volatility_breakout() -> bool:
-            """래리 윌리엄스 변동성 돌파 조건 판정 (True=돌파 확인)"""
+            """래리 윌리엄스 변동성 돌파 조건 판정 (True=돌파 확인)
+            
+            ⚠️ 데이터 제약으로 인해 '전일 범위' 대신 '현재 캔들 고가-저가(H-L) 범위'로 근사하여 판정합니다.
+            이는 매매 신호가 너무 잦아질 수 있으므로 보너스 가중치를 보수적으로 설정(0.10)합니다.
+            """
             try:
                 if open_raw is None or high_raw is None or low_raw is None or volume_raw is None:
                     return False
@@ -288,10 +292,10 @@ class RuleBasedPredictor(BasePredictor):
             confidence = min(
                 0.70 + (bb_penetration + rsi_extremity) * 0.125, 0.95
             )
-            # [Phase 6] 변동성 돌파 보너스 +0.20 (최대 0.95 캡 적용)
+            # [Phase 6] 변동성 돌파 보너스 +0.10 (현재 캔들 근사 방식, 최대 0.95 캡 적용)
             _vb_bonus = 0.0
             if _check_volatility_breakout():
-                _vb_bonus = 0.20
+                _vb_bonus = 0.10
                 logger.info(
                     "🔥 [RuleBasedPredictor] 변동성 돌파 보너스 적용! BUY 신뢰도 %.4f → %.4f",
                     confidence, min(confidence + _vb_bonus, 0.95),
@@ -329,128 +333,6 @@ class RuleBasedPredictor(BasePredictor):
             f"Close={close}, RSI={rsi_14}, BB=[{bb_lower}, {bb_upper}]"
         )
         return "HOLD", 0.0
-
-    def prepare_sequence_data(self, session, symbol: str, window_size: int = 60) -> Optional[np.ndarray]:
-        """
-        [LSTM/Transformer 대비 3차원 시계열 윈도우 변환 엔진]
-        최근 `window_size`개의 MarketData를 조회하여 딥러닝 모델 입력용 3차원 텐서(1, window_size, 11)로 변환합니다.
-        
-        피처 스펙: [open, high, low, close, volume, sma_20, rsi_14, bb_upper, atr_14, macd_line, macd_signal]
-        """
-        from sqlalchemy import desc
-        
-        # 1. DB에서 최신 데이터 window_size 만큼 조회
-        records = session.query(MarketData).filter(
-            MarketData.symbol == symbol
-        ).order_by(desc(MarketData.timestamp)).limit(window_size).all()
-        
-        # 2. 초기 Warm-up 구간 (데이터 부족) 검증
-        if len(records) < window_size:
-            logger.warning(
-                f"⚠️ [Sequence Prep] 데이터 부족 (현재 {len(records)}/{window_size}개). "
-                f"모델 추론에 필요한 Warm-up 구간이므로 시퀀스 변환을 생략합니다."
-            )
-            return None
-            
-        # 3. 모델 입력을 위해 시간 순(과거 -> 최신)으로 역순 정렬
-        records.reverse()
-        
-        # 4. 2차원 피처 행렬(Feature Matrix) 가공 (60, 11)
-        feature_list = []
-        for r in records:
-            # 결측치(None) 및 NaN(Not a Number) 방어 처리를 포함하여 안전하게 float 형변환
-            def _safe_float(val, fallback):
-                if val is None:
-                    return float(fallback)
-                try:
-                    f_val = float(val)
-                    return float(fallback) if math.isnan(f_val) else f_val
-                except (ValueError, TypeError):
-                    return float(fallback)
-
-            open_val = _safe_float(r.open, 0.0)
-            high_val = _safe_float(r.high, open_val)
-            low_val = _safe_float(r.low, open_val)
-            close_val = _safe_float(r.close, open_val)
-            vol_val = _safe_float(r.volume, 0.0)
-            
-            # 파생 지표 결측치는 종가/중립값으로 강력하게 방어
-            sma_val = _safe_float(r.sma_20, close_val)
-            rsi_val = _safe_float(r.rsi_14, 50.0)
-            bb_up_val = _safe_float(r.bb_upper, close_val)
-            
-            # 신규 3대 고급 피처 결측치 방어
-            atr_val = _safe_float(r.atr_14, 0.0)
-            macd_line_val = _safe_float(r.macd_line, 0.0)
-            macd_sig_val = _safe_float(r.macd_signal, 0.0)
-            
-            feature_list.append([
-                open_val, high_val, low_val, close_val, vol_val,
-                sma_val, rsi_val, bb_up_val, atr_val, macd_line_val, macd_sig_val
-            ])
-            
-        # 2차원 Numpy 배열 생성 (dtype 명시적 강제)
-        seq_array = np.array(feature_list, dtype=np.float32)
-        
-        # 5. AI 입력 표준 규격인 3차원 Tensor (batch_size=1, window_size, features)로 차원 확장
-        tensor_3d = np.expand_dims(seq_array, axis=0)
-        
-        # 6. 작동 검증 및 텐서 스펙 로깅
-        logger.info(f"🧠 [Tensor Ready] Shape: {tensor_3d.shape}")
-        
-        return tensor_3d
-
-    def predict_ml(self, session, symbol: str) -> str:
-        """
-        [ML 실시간 프로덕션 추론 레이어]
-        학습된 XGBoost 모델(xgb_btc_v1.json)을 활용하여 실시간 추론을 집행합니다.
-        가중치 파일 부재 시 기존 Rule-Based 시스템으로 자동 폴백(Fallback)됩니다.
-        """
-        # 0. 폴백 가드 (모델 로드 실패 시)
-        if self.model is None:
-            from sqlalchemy import desc
-            logger.warning("⚠️ [ML Fallback] XGBoost 모델이 로드되지 않아 Rule-Based 알고리즘으로 자동 폴백합니다.")
-            latest_data = session.query(MarketData).filter(MarketData.symbol == symbol).order_by(desc(MarketData.timestamp)).first()
-            if latest_data:
-                return self.predict(latest_data)
-            return "HOLD"
-
-        # 1. 3차원 텐서 (1, 60, 8) 추출
-        tensor_3d = self.prepare_sequence_data(session, symbol)
-        
-        if tensor_3d is None:
-            logger.info("⏸️ [ML Inference] 데이터 부족(Warm-up)으로 추론 스킵 -> HOLD 반환")
-            return "HOLD"
-            
-        # 2. ML 입력용 차원 축소 및 타입 보장: (1, 60, 11) -> (1, 660) 2차원 매트릭스로 재배열
-        # XGBoost C 엔진 에러 방지를 위해 명시적으로 astype(np.float32) 캐스팅
-        X_input = tensor_3d.reshape(1, -1).astype(np.float32)
-        logger.debug(f"📐 [ML Flatten] 3D Tensor {tensor_3d.shape} -> 2D Matrix {X_input.shape}")
-        
-        # 3. XGBoost 실전 추론
-        try:
-            # predict()는 [클래스_라벨] 형태의 1D Array를 반환하므로 [0] 인덱스로 추출
-            pred_class = self.model.predict(X_input)[0]
-            
-            # 예측 시그널 매핑: 1 (상승 예측) -> BUY, 0 (하락 예측) -> SELL
-            if pred_class == 1:
-                action = "BUY"
-            elif pred_class == 0:
-                action = "SELL"
-            else:
-                action = "HOLD"
-                
-            # 4. 검증 로그 출력 및 결과 반환
-            logger.info(f"🧠 [AI Inference Success] Action: {action} (Class: {pred_class})")
-            return action
-            
-        except Exception as e:
-            from sqlalchemy import desc
-            logger.error(f"❌ [AI Inference Error] AI 추론 실패 상세 원인: {e}", exc_info=True)
-            latest_data = session.query(MarketData).filter(MarketData.symbol == symbol).order_by(desc(MarketData.timestamp)).first()
-            if latest_data:
-                return self.predict(latest_data)
-            return "HOLD"
 
 
 

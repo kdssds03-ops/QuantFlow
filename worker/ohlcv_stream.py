@@ -173,7 +173,7 @@ class OhlcvStreamManager:
         """
         key = self._normalize(symbol)
         last = self._last_update.get(key, 0.0)
-        return (time.monotonic() - last) < max_stale_sec
+        return self._running and (time.monotonic() - last) < max_stale_sec
 
     def queue_size(self, symbol: str) -> int:
         """현재 큐에 쌓인 캔들 수를 반환합니다."""

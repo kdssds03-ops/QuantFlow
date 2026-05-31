@@ -40,7 +40,6 @@ celery_app.conf.update(
         "worker.tasks.fetch_market_data_task": {"queue": "market_data"},
         "worker.tasks.analyze_and_trade":     {"queue": "trading"},
         "worker.tasks.check_time_sync_task":  {"queue": "default"},
-        "worker.tasks.daily_report_task":     {"queue": "default"},
         "worker.tasks.generate_daily_report_task": {"queue": "default"},
         # [Deadlock 근본 차단] 텔레그램 리스너 전용 큐 분리
         # trading/market_data/default 워커와 슬롯 공유 완전 차단

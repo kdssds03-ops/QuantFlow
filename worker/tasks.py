@@ -61,7 +61,9 @@ from app.models.models import MarketData, TradeHistory
 # ohlcv_stream_manager.start() — 필요 시 명시적으로 호출하여 WebSocket 연결을 시작합니다.
 try:
     from worker.ohlcv_stream import ohlcv_stream_manager as _ohlcv_stream
-    logging.getLogger(__name__).info("⚡ [OhlcvStream] 인메모리 큐 레이어 로드 완료")
+    if _ohlcv_stream is not None:
+        _ohlcv_stream.start(["BTC/USDT"])
+    logging.getLogger(__name__).info("⚡ [OhlcvStream] 인메모리 큐 레이어 로드 및 스트림 시작 완료")
 except ImportError:
     _ohlcv_stream = None
     logging.getLogger(__name__).warning(
@@ -128,14 +130,27 @@ def _resolve_predictor() -> BasePredictor:
 # Celery 워커 최초 메모리 가동 시 1회 싱글턴 초기화 수행
 _predictor: BasePredictor = _resolve_predictor()
 
-# ── [웰컴 알림] 파일시스템 영속성 플래그 기반 멱등성 가드 ────────────────
-# Celery prefork 워커는 서브프로세스 분기 시 모듈을 재임포트할 수 있어
-# Python 임포트 캐싱만으로는 중복 발송을 막을 수 없음.
-# → 로컬 파일시스템에 .welcome_sent 플래그 파일이 존재하는지를 영속성 체크 기준으로 사용.
-# → 발송 성공 후에만 플래그를 생성하여, 발송 실패 시 다음 기동 때 자동 재시도되도록 설계.
-_WELCOME_FLAG_FILE = ".welcome_sent"
+# ── [웰컴 알림] Redis 기반 글로벌 멱등성 가드 ────────────────
+# 다중 컨테이너 격리 환경(worker, listener, api, beat 등)에서도 
+# 글로벌 공유 인프라인 Redis 키를 활용하여 딱 1회만 알림이 전송되도록 가드합니다.
+_WELCOME_REDIS_KEY = "quantflow:welcome_sent_flag"
+_welcome_already_sent = False
 
-if not os.path.exists(_WELCOME_FLAG_FILE):
+try:
+    _r_welcome = _sync_redis_lib.Redis.from_url(
+        settings.redis_url, decode_responses=True, socket_connect_timeout=2
+    )
+    # Redis의 set(..., nx=True) 원자적 연산을 사용하여 단 하나의 컨테이너만 발송 성공하도록 보장
+    # 24시간(86400초) 동안 웰컴 키 유지하여 봇이 자주 재시작할 때 스팸 방지
+    _welcome_already_sent = not _r_welcome.set(_WELCOME_REDIS_KEY, "sent", ex=86400, nx=True)
+except Exception as _welcome_redis_exc:
+    # 만약 Redis가 점검 중이거나 접속 실패하면, 컨테이너별 로컬 임시파일 시스템으로 자동 폴백
+    logger.warning("⚠️ [웰컴 알림] Redis 플래그 확인 실패 → 로컬 파일 시스템으로 폴백합니다: %s", _welcome_redis_exc)
+    import tempfile
+    _WELCOME_FLAG_FILE = os.path.join(tempfile.gettempdir(), "quantflow_welcome_sent")
+    _welcome_already_sent = os.path.exists(_WELCOME_FLAG_FILE)
+
+if not _welcome_already_sent:
     try:
         from core.notifier import send_telegram_message
         _predictor_name = type(_predictor).__name__
@@ -147,16 +162,24 @@ if not os.path.exists(_WELCOME_FLAG_FILE):
             f"• <b>환경 변수 PREDICTOR_TYPE:</b> <code>{os.getenv('PREDICTOR_TYPE', 'RULE (기본값)')}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━"
         )
-        # 발송 성공 시에만 플래그 파일 생성 → 이후 기동부터는 이 블록 진입 자체를 차단
-        with open(_WELCOME_FLAG_FILE, "w") as _f:
-            from datetime import datetime as _dt
-            _f.write(f"sent at {_dt.now().isoformat()}")
-        logger.info("🚩 [웰컴 알림] 발송 완료 — 플래그 파일 생성됨: %s", _WELCOME_FLAG_FILE)
+        # Redis 연결 문제로 로컬 파일로 폴백한 경우 파일 생성
+        try:
+            if 'tempfile' in locals() or '_WELCOME_FLAG_FILE' in locals():
+                with open(_WELCOME_FLAG_FILE, "w") as _f:
+                    from datetime import datetime as _dt
+                    _f.write(f"sent at {_dt.now().isoformat()}")
+        except Exception:
+            pass
+        logger.info("🚩 [웰컴 알림] 글로벌 가동 완료 메시지 전송 성공")
     except Exception as _e:
-        # 발송 실패 시 플래그를 생성하지 않음 → 다음 워커 재기동 시 자동 재시도
-        logger.error("❌ [웰컴 알림] 발송 실패 (플래그 미생성, 다음 기동 시 재시도): %s", _e)
+        # 전송 실패 시 Redis 키 삭제하여 재시도 가능하게 조치
+        logger.error("❌ [웰컴 알림] 발송 실패 (글로벌 락 해제, 다음 기동 시 재시도): %s", _e)
+        try:
+            _r_welcome.delete(_WELCOME_REDIS_KEY)
+        except Exception:
+            pass
 else:
-    logger.debug("🚩 [웰컴 알림] 플래그 파일 감지 — 중복 발송 차단: %s", _WELCOME_FLAG_FILE)
+    logger.debug("🚩 [웰컴 알림] 글로벌/로컬 플래그 감지 — 중복 발송 차단")
 
 # ── [Strict Rules] 정밀도 유지 및 리스크 관리 임계치 설정 ────────────────
 TRADE_AMOUNT_BTC = Decimal("0.001")     # 일반 float(0.001)에서 Decimal 구조로 정형화
@@ -560,8 +583,10 @@ def _ensure_utc(ts_ms: int) -> datetime:
 
 
 def _to_dec(val) -> Decimal | None:
-    """float/Decimal NaN 및 None을 안전하게 None으로 변환 후 Decimal 반환."""
+    """float/Decimal NaN 및 None, pd.NA를 안전하게 None으로 변환 후 Decimal 반환."""
     if val is None:
+        return None
+    if pd.isna(val):
         return None
     if isinstance(val, float) and math.isnan(val):
         return None
@@ -1163,7 +1188,7 @@ def _run_async_safe(coro):
             loop = None
 
         is_new_loop = False
-        if loop is None or loop.is_closed():
+        if loop is None or loop.is_closed() or loop.is_running():
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             is_new_loop = True
@@ -1806,6 +1831,51 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                     _run_async_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
+                        side="BUY",
+                        price=sl_result["filled_price"],
+                        amount=sl_record_amount,
+                        status=sl_result["status"],
+                    ))
+                    logger.info(
+                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장 완료 (스레드 격리 비동기): status=%s, order_id=%s",
+                        sl_result["status"], sl_result["order_id"]
+                    )
+
+                    return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
+
+            elif current_position == "LONG" and entry_price:
+                # 롱 포지션 수익률: 가격이 상승해야 수익 (+)
+                price_return = (current_close - entry_price) / entry_price
+                if price_return <= STOP_LOSS_THRESHOLD:
+                    logger.warning(f"🚨 [손절 방패 가동] 평단가: {entry_price} -> 현재가: {current_close} ({price_return*100:.2f}%)")
+                    
+                    calculated_amount = pos_contracts
+                    
+                    # 방어적 검증 (Short-circuit): 최소 주문 수량 미만 검사
+                    if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
+                        logger.warning(
+                            f"⏸️  [손절 방패] 계산된 청산 수량이 부족하여 주문 생략: "
+                            f"계산된 수량={calculated_amount}, 최소 필요={MIN_ORDER_BTC}"
+                        )
+                        return {"status": "insufficient_calculated_amount"}
+
+                    # 🚀 프로덕션 등급 주문 집행 파이프라인 호출 (손절 방패)
+                    sl_result: OrderResult = _execute_order_pipeline(
+                        exchange=exchange,
+                        symbol=symbol,
+                        side="SELL",  # 롱 포지션 청산은 SELL
+                        amount=calculated_amount,
+                        trigger_type="STOP_LOSS_SHIELD",
+                        fallback_price=current_close,
+                        confidence=1.0,
+                        usdt_balance=usdt_balance,
+                    )
+
+                    # 이력 저장
+                    sl_record_amount = sl_result["filled_amount"] if sl_result["filled_amount"] > Decimal("0") else calculated_amount
+                    _run_async_safe(_async_save_trade_history(
+                        timestamp=datetime.now(timezone.utc),
+                        symbol=symbol,
                         side="SELL",
                         price=sl_result["filled_price"],
                         amount=sl_record_amount,
@@ -1977,6 +2047,154 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         # Guard-C: 하드 TP/SL 기존 포맷 유지
                         notifier.send_message(
                             f"🔔 <b>[QuantFlow] {_hard_trigger} (Short Cover)</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
+                    return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
+
+            elif current_position == "LONG" and entry_price:
+                # 롱 포지션 수익률 (현재가 - 진입가) / 진입가
+                price_return = (current_close - entry_price) / entry_price
+                now_utc_check = datetime.now(timezone.utc)
+
+                entry_ts: datetime | None = None
+                try:
+                    _update_time_ms = int(_api_pos_raw.get("updateTime", 0) or 0)
+                    if _update_time_ms > 0:
+                        entry_ts = datetime.fromtimestamp(
+                            _update_time_ms / 1000.0, tz=timezone.utc
+                        )
+                except Exception as _ts_exc:
+                    logger.warning("⚠️ [포지션 진입 시각] updateTime 파싱 실패: %s", _ts_exc)
+
+                if entry_ts is not None:
+                    minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
+                else:
+                    minutes_held = 0.0
+                    logger.warning(
+                        "⚠️ [포지션 보유 시간] updateTime 없음 → 타임아웃 가드 비활성화 (이번 턴 스킵)"
+                    )
+
+                # ── [Guard-B] Peak ROI 추적 레지스터 업데이트 ─────────────────────
+                _reg_key = _normalize_symbol(symbol)
+                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
+                if price_return > _current_peak:
+                    _peak_roi_register[_reg_key] = price_return
+                    logger.info(
+                        "📈 [TRAILING_STOP] Peak ROI 신고점 갱신: symbol=%s (key=%s), peak=%.2f%%, current=%.2f%%",
+                        symbol, _reg_key, float(price_return) * 100, float(price_return) * 100,
+                    )
+                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
+
+                _hard_trigger: str | None = None
+                _hard_reason: str = ""
+
+                # ── [Guard-A] 타임아웃 EXIT (최우선) ─────────────────────────────
+                if entry_ts is not None and minutes_held >= MAX_POSITION_MINUTES:
+                    _hard_trigger = "TIMEOUT_EXIT"
+                    _hard_reason  = (
+                        f"장기 횡보 타임아웃 — "
+                        f"보유 {minutes_held:.0f}분 → 상한 {MAX_POSITION_MINUTES}분 초과"
+                    )
+
+                # ── [Guard-B] 트레일링 스탑 (타임아웃 미발동 시 검사) ────────────
+                elif (
+                    _current_peak >= TRAILING_STOP_ACTIVATION_ROI
+                    and (_current_peak - price_return) >= TRAILING_STOP_DRAWDOWN
+                ):
+                    _hard_trigger = "TRAILING_STOP_EXIT"
+                    _hard_reason  = (
+                        f"익절 보존 가드 발동 — "
+                        f"Peak ROI {float(_current_peak)*100:+.2f}% 달성 후 "
+                        f"현재 {float(price_return)*100:+.2f}%로 "
+                        f"{float(_current_peak - price_return)*100:.2f}% 반납"
+                    )
+
+                # ── [Guard-C] 하드 TP / 하드 SL ───────
+                elif price_return >= HARD_TP_THRESHOLD:
+                    _hard_trigger = "HARD_TP_EXIT"
+                    _hard_reason  = f"롱 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
+                elif price_return <= HARD_SL_THRESHOLD:
+                    _hard_trigger = "HARD_SL_EXIT"
+                    _hard_reason  = f"롱 수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
+
+                if _hard_trigger:
+                    logger.warning(
+                        "🔔 [%s] 롱 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
+                        _hard_trigger, _hard_reason, entry_price, current_close, minutes_held,
+                    )
+                    _hard_amount = pos_contracts
+                    if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
+                        logger.warning("[%s] 롱 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
+                        return {"status": "insufficient_amount_for_hard_exit"}
+
+                    _hard_result: OrderResult = _execute_order_pipeline(
+                        exchange=exchange,
+                        symbol=symbol,
+                        side="SELL",  # 롱 청산은 SELL
+                        amount=_hard_amount,
+                        trigger_type=_hard_trigger,
+                        fallback_price=current_close,
+                        confidence=1.0,
+                        usdt_balance=usdt_balance,
+                    )
+                    _hard_rec_amount = (
+                        _hard_result["filled_amount"]
+                        if _hard_result["filled_amount"] > Decimal("0")
+                        else _hard_amount
+                    )
+                    # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
+                    _run_async_safe(_async_save_trade_history(
+                        timestamp=datetime.now(timezone.utc),
+                        symbol=symbol,
+                        side="SELL",
+                        price=_hard_result["filled_price"],
+                        amount=_hard_rec_amount,
+                        status=_hard_result["status"],
+                    ))
+
+                    # ── 청산 완료 후 Peak ROI 레지스터 초기화 ──
+                    _peak_roi_register.pop(_normalize_symbol(symbol), None)
+                    logger.info(
+                        "🧹 [%s] Peak ROI 레지스터 초기화 완료 (symbol=%s, key=%s)",
+                        _hard_trigger, symbol, _normalize_symbol(symbol),
+                    )
+
+                    # ── 가드별 차별화 텔레그램 알림 발송 ─────────────────────────
+                    if _hard_trigger == "TIMEOUT_EXIT":
+                        notifier.send_message(
+                            f"⏱️ <b>[TIMEOUT_EXIT] 장기 횡보로 인한 타임아웃 청산 완료</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
+                    elif _hard_trigger == "TRAILING_STOP_EXIT":
+                        notifier.send_message(
+                            f"📈 <b>[TRAILING_STOP_EXIT] 익절 보존 가드 발동! 수익 잠금 완료</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━\n"
+                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
+                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
+                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
+                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
+                            f"• <b>최고 수익률(Peak):</b> <code>{float(_current_peak)*100:+.2f}%</code>\n"
+                            f"• <b>청산 시 수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
+                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
+                            f"━━━━━━━━━━━━━━━━━━━━"
+                        )
+                    else:
+                        # Guard-C: 하드 TP/SL 기존 포맷 유지
+                        notifier.send_message(
+                            f"🔔 <b>[QuantFlow] {_hard_trigger} (Long Exit)</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
                             f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
@@ -2230,6 +2448,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                                 "(계산 수량=%s < MIN=%s)",
                                 _add_amount, MIN_ORDER_BTC,
                             )
+                    else:
                         logger.info(
                             "🔒 [불타기 엔진] 최대 횟수(%d회) 도달 → 추격 매수 한도 초과 스킵",
                             _effective_pyramid_max,
@@ -2450,173 +2669,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
 def check_time_sync_task():
     return {"ntp_drift_ms": round(check_ntp_drift(), 1)}
 
-@celery_app.task(name="worker.tasks.daily_report_task", queue="default")
-def daily_report_task():
-    """
-    📊 QuantFlow 일간 결산 리포트 — Celery Beat에 의해 매일 자정(UTC) 호출.
-    지난 24시간 매매 성과를 정밀 집계하여 텔레그램 HTML 리포트로 발송합니다.
-    """
-    logger.info("📊 [일간 결산] 리포트 생성 파이프라인 가동")
 
-    try:
-        now_utc = datetime.now(timezone.utc)
-        cutoff = now_utc - timedelta(days=1)
-
-        for session in _get_sync_session():
-            # ── 1. 지난 24시간 전체 매매 내역 스캔 ──────────────────────────
-            trades = (
-                session.query(TradeHistory)
-                .filter(TradeHistory.timestamp >= cutoff)
-                .order_by(TradeHistory.timestamp)
-                .all()
-            )
-
-            # [Short-circuit] 매매 이력 없으면 스킵 메시지 전송 후 조기 리턴
-            if not trades:
-                logger.info("📊 지난 24시간 매매 이력 없음 — 리포트 스킵")
-                notifier.send_message(
-                    "📊 <b>[QuantFlow 일간 결산]</b>\n"
-                    "지난 24시간 동안 발생한 매매 이력이 없어 리포트 생성을 스킵합니다."
-                )
-                return {"status": "skipped_no_trades"}
-
-            # ── 2. 기본 집계 지표 산출 ─────────────────────────────────────
-            total_count = len(trades)
-            filled_trades = [t for t in trades if t.status == "FILLED"]
-            filled_count = len(filled_trades)
-            rejected_count = sum(1 for t in trades if t.status == "REJECTED")
-            failed_count = sum(1 for t in trades if t.status == "FAILED")
-
-            # ── 3. 간이 PnL 모델 (Σ SELL 체결총액 − Σ BUY 체결총액) ───────
-            total_buy_value = Decimal("0")
-            total_sell_value = Decimal("0")
-            total_buy_amount = Decimal("0")
-            total_sell_amount = Decimal("0")
-
-            for t in filled_trades:
-                # 가격 또는 수량이 None인 주문은 안전하게 제외
-                if t.price is None or t.amount is None:
-                    continue
-                trade_value = Decimal(str(t.price)) * Decimal(str(t.amount))
-                if t.side == "BUY":
-                    total_buy_value += trade_value
-                    total_buy_amount += Decimal(str(t.amount))
-                elif t.side == "SELL":
-                    total_sell_value += trade_value
-                    total_sell_amount += Decimal(str(t.amount))
-
-            realized_pnl = total_sell_value - total_buy_value
-
-            # ── 4. 승률(Win Rate) 산출 ────────────────────────────────────
-            #   개별 SELL 건별로 "직전 BUY 체결 평단가" 대비 수익 여부 판정
-            #   직전 BUY가 없는 SELL은 판정 불가로 제외
-            filled_buys = [t for t in filled_trades if t.side == "BUY" and t.price is not None]
-            filled_sells = [t for t in filled_trades if t.side == "SELL" and t.price is not None]
-
-            win_count = 0
-            loss_count = 0
-
-            for sell_trade in filled_sells:
-                # 해당 SELL 시점 이전의 모든 BUY 체결가에서 가중 평단가 산출
-                prior_buys = [
-                    b for b in filled_buys
-                    if b.timestamp <= sell_trade.timestamp and b.symbol == sell_trade.symbol
-                ]
-                if not prior_buys:
-                    continue  # 직전 매수 이력 없으면 승패 판정 불가 → 스킵
-
-                # 가중 평균 매수 단가 = Σ(price × amount) / Σ(amount)
-                sum_cost = Decimal("0")
-                sum_qty = Decimal("0")
-                for b in prior_buys:
-                    sum_cost += Decimal(str(b.price)) * Decimal(str(b.amount))
-                    sum_qty += Decimal(str(b.amount))
-
-                if sum_qty == Decimal("0"):
-                    continue
-
-                avg_buy_price = sum_cost / sum_qty
-                sell_price = Decimal(str(sell_trade.price))
-
-                if sell_price > avg_buy_price:
-                    win_count += 1
-                else:
-                    loss_count += 1
-
-            evaluated_total = win_count + loss_count
-            win_rate_str = f"{(win_count / evaluated_total * 100):.1f}%" if evaluated_total > 0 else "N/A (판정 대상 없음)"
-
-            # ── 5. 체결 성공률 ─────────────────────────────────────────────
-            fill_rate_str = f"{(filled_count / total_count * 100):.1f}%" if total_count > 0 else "N/A"
-
-            # ── 6. PnL 이모지 및 부호 표기 ─────────────────────────────────
-            if realized_pnl > Decimal("0"):
-                pnl_emoji = "📈"
-                pnl_sign = "+"
-            elif realized_pnl < Decimal("0"):
-                pnl_emoji = "📉"
-                pnl_sign = ""  # Decimal 음수는 자동으로 '-' 포함
-            else:
-                pnl_emoji = "➖"
-                pnl_sign = ""
-
-            # ── 7. KST 시간대 표기 ────────────────────────────────────────
-            kst_tz = timezone(timedelta(hours=9))
-            report_time_kst = datetime.now(kst_tz).strftime("%Y-%m-%d %H:%M:%S KST")
-            cutoff_kst = cutoff.astimezone(kst_tz).strftime("%Y-%m-%d %H:%M")
-            now_kst = now_utc.astimezone(kst_tz).strftime("%Y-%m-%d %H:%M")
-
-            # ── 8. 프리미엄 HTML 결산 리포트 조립 ─────────────────────────
-            report_lines = [
-                "📊 <b>[QuantFlow 일간 결산 리포트]</b>",
-                "━━━━━━━━━━━━━━━━━━━━",
-                f"• <b>집계 구간:</b> <code>{cutoff_kst} ~ {now_kst}</code>",
-                "",
-                "📋 <b>매매 활동 요약</b>",
-                "────────────────────",
-                f"• <b>총 주문 시도:</b> <code>{total_count:,}건</code>",
-                f"• <b>체결 완료(FILLED):</b> <code>{filled_count:,}건</code>",
-                f"• <b>거부(REJECTED):</b> <code>{rejected_count:,}건</code>",
-                f"• <b>실패(FAILED):</b> <code>{failed_count:,}건</code>",
-                f"• <b>체결 성공률:</b> <code>{fill_rate_str}</code>",
-                "",
-                "💰 <b>매매 성과 지표</b>",
-                "────────────────────",
-                f"• <b>총 매수 체결액:</b> <code>${total_buy_value:,.2f} USDT</code>",
-                f"• <b>총 매도 체결액:</b> <code>${total_sell_value:,.2f} USDT</code>",
-                f"• {pnl_emoji} <b>실현 손익(PnL):</b> <code>{pnl_sign}{realized_pnl:,.2f} USDT</code>",
-                "",
-                "🎯 <b>승률 분석</b>",
-                "────────────────────",
-                f"• <b>익절(Win):</b> <code>{win_count:,}건</code>",
-                f"• <b>손절(Loss):</b> <code>{loss_count:,}건</code>",
-                f"• <b>승률(Win Rate):</b> <code>{win_rate_str}</code>",
-                "",
-                "📦 <b>수량 요약</b>",
-                "────────────────────",
-                f"• <b>총 매수 수량:</b> <code>{total_buy_amount:,.4f} BTC</code>",
-                f"• <b>총 매도 수량:</b> <code>{total_sell_amount:,.4f} BTC</code>",
-                "━━━━━━━━━━━━━━━━━━━━",
-                f"• <b>리포트 생성:</b> <code>{report_time_kst}</code>",
-            ]
-            report_message = "\n".join(report_lines)
-
-            # ── 9. 텔레그램 전송 ──────────────────────────────────────────
-            notifier.send_message(report_message)
-            logger.info(f"📊 [일간 결산] 리포트 전송 완료 — 총 {total_count}건, PnL: {pnl_sign}{realized_pnl:,.2f} USDT")
-
-            return {
-                "status": "report_sent",
-                "total_trades": total_count,
-                "filled_trades": filled_count,
-                "realized_pnl": str(realized_pnl),
-                "win_rate": win_rate_str,
-            }
-
-    except Exception as exc:
-        logger.error(f"❌ [일간 결산] 리포트 생성 중 예외 발생: {exc}", exc_info=True)
-        # 리포트 실패가 전체 워커를 죽이지 않도록 안전하게 에러 상태만 반환
-        return {"status": "report_failed", "error": str(exc)}
 
 
 # ─────────────────────────────────────────────
@@ -2705,7 +2758,7 @@ def _send_status_brief():
             logger.warning(f"⚠️ CCXT 포지션 조회 실패: {_pos_exc}")
 
         current_position = "HOLD"
-        entry_price = Decimal("0")
+        entry_price = None
         pos_duration_str = "-"
         pos_pnl_str = " (포지션 없음)"
 
@@ -2721,7 +2774,7 @@ def _send_status_brief():
             _unrealized_raw = float(ccxt_pos.get('unrealizedPnl', 0.0) or 0.0)
             if ccxt_pos.get('percentage') is not None:
                 pos_return = float(ccxt_pos['percentage'])
-            elif entry_price > Decimal("0") and pos_amount > Decimal("0"):
+            elif entry_price is not None and entry_price > Decimal("0") and pos_amount > Decimal("0"):
                 _pos_value = float(entry_price * pos_amount)
                 pos_return = (_unrealized_raw / _pos_value * 100) if _pos_value > 0 else 0.0
             else:
@@ -2813,7 +2866,7 @@ def _send_status_brief():
             "📦 <b>현재 유지 포지션</b>",
             "────────────────────",
             f"• <b>상태:</b> <b>{pos_emoji}</b>{pos_pnl_str}",
-            f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price > Decimal("0") else "• <b>평단가:</b> <code>-</code>",
+            f"• <b>평단가:</b> <code>${float(entry_price or 0):,.2f} USDT</code>" if entry_price is not None and entry_price > Decimal("0") else "• <b>평단가:</b> <code>-</code>",
             f"• <b>경과 시간:</b> <code>{pos_duration_str}</code>",
             "",
             "💰 <b>실시간 자산 잔고 (선물 지갑)</b>",
@@ -3168,42 +3221,55 @@ def generate_daily_report_task():
                 if t.side == "BUY" and t.status == "FILLED" and t.price is not None
             ]
 
+            # 숏 진입(SELL)들을 시간 오름차순으로 정렬하여 FIFO 매칭 큐 구성
+            sorted_sells = sorted(all_filled_sells_for_pnl, key=lambda x: x.timestamp)
+            sell_queue = []
+            for s in sorted_sells:
+                if s.price is not None and s.amount is not None:
+                    sell_queue.append({
+                        "price": Decimal(str(s.price)),
+                        "amount": Decimal(str(s.amount)),
+                        "remaining": Decimal(str(s.amount)),
+                        "timestamp": s.timestamp
+                    })
+
+            # 오늘 청산(BUY)들을 시간 오름차순으로 정렬
+            sorted_buys = sorted(today_filled_buys_for_pnl, key=lambda x: x.timestamp)
+
             realized_pnl = Decimal("0")
             win_count    = 0
             loss_count   = 0
 
-            for buy_trade in today_filled_buys_for_pnl:
-                # 해당 BUY 시점 이전 SELL(숏 진입)에서 가중 평단 진입가 산출
-                prior_sells = [
-                    s for s in all_filled_sells_for_pnl
-                    if s.timestamp <= buy_trade.timestamp
-                ]
-                if not prior_sells:
-                    continue
-
-                sum_cost = Decimal("0")
-                sum_qty  = Decimal("0")
-                for s in prior_sells:
-                    if s.price is None or s.amount is None:
+            for buy_trade in sorted_buys:
+                buy_price = Decimal(str(buy_trade.price))
+                buy_qty   = Decimal(str(buy_trade.amount))
+                
+                trade_pnl = Decimal("0")
+                matched_total_qty = Decimal("0")
+                
+                # FIFO 방식으로 이 BUY 이전의 SELL들과 매칭
+                for sell in sell_queue:
+                    if buy_qty <= Decimal("0"):
+                        break
+                    if sell["timestamp"] > buy_trade.timestamp:
+                        # BUY 시점 이후의 진입은 매칭 불가
                         continue
-                    sum_cost += Decimal(str(s.price)) * Decimal(str(s.amount))
-                    sum_qty  += Decimal(str(s.amount))
-
-                if sum_qty == Decimal("0"):
-                    continue
-
-                avg_sell_price = sum_cost / sum_qty       # 숏 진입 가중 평단가
-                buy_price      = Decimal(str(buy_trade.price))
-                buy_qty        = Decimal(str(buy_trade.amount))
-
-                # 숏 PnL: 진입가 > 청산가 일수록 이익
-                trade_pnl    = (avg_sell_price - buy_price) * buy_qty
-                realized_pnl += trade_pnl
-
-                if trade_pnl > Decimal("0"):
-                    win_count  += 1
-                else:
-                    loss_count += 1
+                    if sell["remaining"] <= Decimal("0"):
+                        continue
+                        
+                    match_qty = min(buy_qty, sell["remaining"])
+                    trade_pnl += (sell["price"] - buy_price) * match_qty
+                    matched_total_qty += match_qty
+                    
+                    sell["remaining"] -= match_qty
+                    buy_qty -= match_qty
+                
+                if matched_total_qty > Decimal("0"):
+                    realized_pnl += trade_pnl
+                    if trade_pnl > Decimal("0"):
+                        win_count += 1
+                    else:
+                        loss_count += 1
 
             # ── [STEP 4] 매매 요약 집계 ─────────────────────────────────────────
             total_count    = len(today_trades)

@@ -92,18 +92,17 @@ def get_exchange() -> ccxt.Exchange:
 
     else:
         # ── Mainnet 실전 모드 ───────────────────────────────────────────────
-        exchange = ccxt.binance(
+        exchange = ccxt.binanceusdm(
             {
                 "apiKey": settings.exchange_api_key,
                 "secret": settings.exchange_api_secret,
                 "enableRateLimit": True,
                 "options": {
-                    "defaultType": "spot",
                     "adjustForTimeDifference": True,
                 },
             }
         )
-        logger.info("🟢 [BINANCE] 실제 거래소(Mainnet) 모드 활성화")
+        logger.info("🟢 [BINANCE-USDM] 실제 거래소(Mainnet) 모드 활성화")
 
     return exchange
 

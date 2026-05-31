@@ -185,6 +185,25 @@ _PYRAMID_COUNT_TTL_SEC    = 3600  # 1시간 후 자동 만료 (포지션 정리 
 _ORDER_DEDUP_LOCK_TTL_SEC = 30  # 심볼별 락 유효 시간 (초) — 이 시간 내 재트리거 무시
 _ORDER_DEDUP_LOCK_PREFIX  = "quantflow:order_lock:"  # Redis 키 네임스페이스
 
+# ── [v5.0] 시장 국면 판독기(Regime Classifier) 임계치 ──────────────────────
+# 추세 국면(TREND) 판정: 아래 두 조건 모두 충족 시
+#   1) ADX(14) ≥ ADX_TREND_THRESHOLD (방향성 강도 기준)
+#   2) 현재 ATR ≥ 최근 ATR_LOOKBACK_CANDLES 봉 평균 ATR × ATR_EXPANSION_RATIO (변동성 확장 기준)
+# 하나라도 미충족 시 즉시 횡보 국면(CHOP) 판정.
+ADX_TREND_THRESHOLD    = 25.0              # ADX 추세 강도 판정 임계치
+ATR_EXPANSION_RATIO    = Decimal("1.5")   # ATR 변동성 확장 배율 (현재 ATR / 평균 ATR)
+ATR_LOOKBACK_CANDLES   = 240              # ATR 기준 평균 산출 기간 (1분봉 240개 = 4시간)
+
+# ── [v5.0] 횡보 국면 피라미딩 강제 잠금 파라미터 ─────────────────────────
+PYRAMID_MAX_ADDS_CHOP  = 0               # 횡보 국면 시 불타기 횟수 강제 0 (전면 봉쇄)
+PRICE_BUFFER_PCT_CHOP  = Decimal("0.005") # 횡보 국면 피라미딩 가드 (0.5% 보수 기준)
+
+# ── [v5.0] 인프라 레벨 리스크 방화벽 임계치 ──────────────────────────────
+# 자본 방화벽: 단일 심볼 누적 증거금이 가용 마진의 MAX_CAPITAL_PCT 초과 시 주문 거부
+MAX_CAPITAL_PER_SYMBOL_PCT = Decimal("0.20")  # 20% 한도
+# 슬리페이지 가드: WebSocket 최신가 vs 호가창 스프레드 괴리 허용 한도
+SLIPPAGE_GUARD_PCT         = Decimal("0.001") # 0.1% 초과 시 주문 REJECTED
+
 # ── [8차 확장] 하드 TP/SL + 타임아웃 안전장치 임계치 ────────────────────
 HARD_SL_THRESHOLD   = Decimal("-0.0150") # -1.5% 하드 손절 컷 (무조건 강제 청산)
 HARD_TP_THRESHOLD   = Decimal("0.0300")  # +3.0% 하드 익절 타겟 (무조건 강제 수확)
@@ -554,10 +573,287 @@ def _to_dec(val) -> Decimal | None:
     except Exception:
         return None
 
+# ══════════════════════════════════════════════════════════════════════════
+# 🧭 [v5.0] 시장 국면 판독기(Regime Classifier) — 인프라 레벨 최상단 컴포넌트
+# ══════════════════════════════════════════════════════════════════════════
+
+def _classify_market_regime(
+    df: pd.DataFrame,
+    adx_threshold: float = 25.0,
+    atr_ratio: Decimal = Decimal("1.5"),
+    atr_lookback: int = 240,
+) -> tuple:
+    """
+    시장 국면 판독기 (Regime Classifier).
+
+    [판정 로직 - AND 조건]
+    추세 국면(TREND): 아래 두 조건을 모두 충족
+      1. ADX(14) 최신값 >= adx_threshold (기본 25.0)
+      2. 현재 ATR(14) >= 최근 atr_lookback 봉 평균 ATR x atr_ratio (기본 1.5배)
+    횡보 국면(CHOP): 위 조건 중 하나라도 미충족
+    FLAT_HOLD 모드: ADX/ATR/RSI/BB 지표 중 하나라도 NaN -> 즉시 보수 모드
+
+    Args:
+        df           : compute_all_features()가 적용된 OHLCV DataFrame
+        adx_threshold: ADX 추세 강도 임계치 (기본 25.0)
+        atr_ratio    : ATR 변동성 확장 배율 임계치 (기본 1.5)
+        atr_lookback : ATR 평균 산출 기간 (기본 240봉)
+
+    Returns:
+        tuple("TREND" | "CHOP" | "FLAT_HOLD", metadata_dict)
+    """
+    meta: dict = {
+        "adx_val": None,
+        "atr_current": None,
+        "atr_avg": None,
+        "atr_ratio_actual": None,
+        "reason": "",
+    }
+
+    try:
+        # -- [Step 1] 지표 NaN Failsafe 검증 ----------------------------------------
+        # 판별 지표 어느 하나라도 NaN/None이면 즉시 FLAT_HOLD 반환.
+        # pd.isna()는 float NaN / numpy NaN / None / pd.NA 모두 커버.
+        last = df.iloc[-1]
+
+        _raw_adx = last.get("adx_14")
+        _raw_atr = last.get("atr_14")
+        _raw_rsi = last.get("rsi_14")
+        _raw_bbu = last.get("bb_upper")
+        _raw_bbl = last.get("bb_lower")
+
+        for _field_name, _field_val in [
+            ("adx_14",   _raw_adx),
+            ("atr_14",   _raw_atr),
+            ("rsi_14",   _raw_rsi),
+            ("bb_upper", _raw_bbu),
+            ("bb_lower", _raw_bbl),
+        ]:
+            if _field_val is None:
+                meta["reason"] = f"NaN Failsafe: {_field_name} is None"
+                logger.warning(
+                    "⚠️ [REGIME] NaN Failsafe 발동 — %s is None → FLAT_HOLD 모드 전환",
+                    _field_name,
+                )
+                return ("FLAT_HOLD", meta)
+            try:
+                if pd.isna(_field_val):
+                    meta["reason"] = f"NaN Failsafe: {_field_name} is NaN"
+                    logger.warning(
+                        "⚠️ [REGIME] NaN Failsafe 발동 — %s is NaN → FLAT_HOLD 모드 전환",
+                        _field_name,
+                    )
+                    return ("FLAT_HOLD", meta)
+            except (TypeError, ValueError):
+                pass
+
+        # -- [Step 2] 지표값 안전 추출 ------------------------------------------------
+        adx_val = float(_raw_adx)
+        atr_current = Decimal(str(_raw_atr))
+        meta["adx_val"] = adx_val
+        meta["atr_current"] = float(atr_current)
+
+        # -- [Step 3] ATR 기준 평균 산출 (최근 atr_lookback 봉) ----------------------
+        atr_series = df["atr_14"].dropna()
+        if len(atr_series) < 2:
+            meta["reason"] = "ATR 데이터 부족 (유효 봉 < 2) → FLAT_HOLD"
+            logger.warning("⚠️ [REGIME] ATR 유효 데이터 부족 → FLAT_HOLD 모드")
+            return ("FLAT_HOLD", meta)
+
+        recent_atr = atr_series.tail(atr_lookback)
+        atr_avg = Decimal(str(float(recent_atr.mean())))
+        meta["atr_avg"] = float(atr_avg)
+
+        # -- [Step 4] 0 나눗셈 방어 ---------------------------------------------------
+        if atr_avg <= Decimal("0"):
+            meta["reason"] = "ATR 평균이 0 이하 → FLAT_HOLD (0 나눗셈 방지)"
+            logger.warning("⚠️ [REGIME] ATR 평균 = 0 → FLAT_HOLD 모드")
+            return ("FLAT_HOLD", meta)
+
+        # -- [Step 5] 추세/횡보 판정 (AND 조건) ---------------------------------------
+        atr_ratio_actual = atr_current / atr_avg
+        meta["atr_ratio_actual"] = float(atr_ratio_actual)
+
+        cond_adx = adx_val >= adx_threshold
+        cond_atr = atr_ratio_actual >= atr_ratio
+
+        if cond_adx and cond_atr:
+            meta["reason"] = (
+                f"TREND: ADX={adx_val:.2f}>={adx_threshold}, "
+                f"ATR배율={float(atr_ratio_actual):.3f}>={float(atr_ratio)}"
+            )
+            logger.info(
+                "📈 [REGIME] 추세 국면(TREND) 판정 — ADX=%.2f (>=%.0f), "
+                "ATR배율=%.3f (>=%.1f) → 피라미딩 공격성 유지",
+                adx_val, adx_threshold, float(atr_ratio_actual), float(atr_ratio),
+            )
+            return ("TREND", meta)
+        else:
+            miss = []
+            if not cond_adx:
+                miss.append(f"ADX={adx_val:.2f}<{adx_threshold}")
+            if not cond_atr:
+                miss.append(f"ATR배율={float(atr_ratio_actual):.3f}<{float(atr_ratio)}")
+            meta["reason"] = "CHOP: " + ", ".join(miss)
+            logger.info(
+                "🌀 [REGIME] 횡보 국면(CHOP) 판정 — %s → 피라미딩 봉쇄, 버퍼 0.5%% 상향",
+                meta["reason"],
+            )
+            return ("CHOP", meta)
+
+    except Exception as _regime_exc:
+        meta["reason"] = f"Regime 판정 중 예외: {_regime_exc}"
+        logger.error(
+            "❌ [REGIME] 국면 판정 중 예외 발생 → FLAT_HOLD 보수 처리: %s",
+            _regime_exc, exc_info=True,
+        )
+        return ("FLAT_HOLD", meta)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 🛡️ [v5.0] 인프라 레벨 리스크 방화벽 — 자본 한도 & 슬리페이지 가드
+# ══════════════════════════════════════════════════════════════════════════
+
+def _check_capital_guard(
+    symbol: str,
+    order_usdt_value: Decimal,
+    usdt_free: Decimal,
+    max_pct: Decimal = Decimal("0.20"),
+) -> bool:
+    """
+    최대 진입 한도 강제 가드 (자본 방화벽).
+
+    단일 심볼에 할당되는 주문 USDT 환산 증거금이 가용 마진(usdt_free)의
+    max_pct(기본 20%)를 초과할 경우 False(주문 거부)를 반환합니다.
+
+    Args:
+        symbol           : 거래 심볼 (로그 출력 전용)
+        order_usdt_value : 주문 USDT 환산 가치 (가격 x 수량)
+        usdt_free        : 선물 지갑 가용 마진 잔고
+        max_pct          : 허용 최대 비율 (기본 0.20 = 20%)
+
+    Returns:
+        True  — 주문 허용
+        False — 주문 거부 (한도 초과)
+    """
+    try:
+        if usdt_free <= Decimal("0"):
+            logger.error(
+                "🚨 [CAPITAL_GUARD] '%s' 가용 마진이 0 이하 → 주문 즉시 거부: usdt_free=%s",
+                symbol, usdt_free,
+            )
+            return False
+
+        cap_limit = usdt_free * max_pct
+        if order_usdt_value > cap_limit:
+            logger.error(
+                "🚨 [CAPITAL_GUARD] '%s' 주문 한도 초과 → 주문 거부: "
+                "주문액=%.2f USDT > 한도(%.0f%% x %.2f USDT = %.2f USDT)",
+                symbol,
+                float(order_usdt_value),
+                float(max_pct) * 100,
+                float(usdt_free),
+                float(cap_limit),
+            )
+            return False
+
+        logger.debug(
+            "✅ [CAPITAL_GUARD] '%s' 자본 한도 통과: 주문액=%.2f USDT <= 한도=%.2f USDT",
+            symbol, float(order_usdt_value), float(cap_limit),
+        )
+        return True
+
+    except Exception as _cap_exc:
+        logger.error(
+            "❌ [CAPITAL_GUARD] 자본 한도 검증 중 예외 → 주문 거부 (안전 처리): %s", _cap_exc
+        )
+        return False
+
+
+def _check_slippage_guard(
+    exchange: ccxt.Exchange,
+    symbol: str,
+    ref_price: Decimal,
+    side: str,
+    limit_pct: Decimal = Decimal("0.001"),
+) -> bool:
+    """
+    허용 슬리페이지 가드 인터페이스 (인프라 레벨 Short-circuit).
+
+    시장가 주문 집행 직전, WebSocket 최신 체결가(ref_price) 대비
+    실제 호가창의 최우선 호가(BUY→ask / SELL→bid) 스프레드 괴리가
+    limit_pct(기본 0.1%)를 초과하면 False(REJECTED 처리 지시)를 반환합니다.
+
+    Args:
+        exchange  : ccxt.Exchange 인스턴스
+        symbol    : 거래 심볼
+        ref_price : WebSocket 최신 체결가 (기준 가격)
+        side      : 주문 방향 ("BUY" | "SELL")
+        limit_pct : 허용 슬리페이지 비율 (기본 0.001 = 0.1%)
+
+    Returns:
+        True  — 슬리페이지 허용 범위 내 → 주문 허용
+        False — 슬리페이지 초과 → 주문 REJECTED
+    """
+    try:
+        if ref_price <= Decimal("0"):
+            logger.error(
+                "🚨 [SLIPPAGE_GUARD] '%s' 기준가(ref_price)가 0 이하 → 주문 거부: ref_price=%s",
+                symbol, ref_price,
+            )
+            return False
+
+        ob = exchange.fetch_order_book(symbol, limit=1)
+        asks = ob.get("asks", [])
+        bids = ob.get("bids", [])
+
+        if side.upper() == "BUY":
+            if not asks:
+                logger.warning(
+                    "⚠️ [SLIPPAGE_GUARD] '%s' 매도 호가 없음 → 슬리페이지 검증 스킵 (허용)", symbol
+                )
+                return True
+            market_price = Decimal(str(asks[0][0]))
+        else:
+            if not bids:
+                logger.warning(
+                    "⚠️ [SLIPPAGE_GUARD] '%s' 매수 호가 없음 → 슬리페이지 검증 스킵 (허용)", symbol
+                )
+                return True
+            market_price = Decimal(str(bids[0][0]))
+
+        # 괴리율 산출 (ref_price > 0 조건으로 0 나눗셈 이미 보장)
+        deviation = abs(market_price - ref_price) / ref_price
+
+        if deviation > limit_pct:
+            logger.error(
+                "🚨 [SLIPPAGE_GUARD] '%s' 슬리페이지 초과 → 주문 REJECTED: "
+                "괴리율=%.4f%% > 허용=%.4f%% (기준가=%s, 호가=%s)",
+                symbol,
+                float(deviation) * 100, float(limit_pct) * 100,
+                ref_price, market_price,
+            )
+            return False
+
+        logger.debug(
+            "✅ [SLIPPAGE_GUARD] '%s' 슬리페이지 통과: 괴리율=%.4f%% <= %.4f%%",
+            symbol, float(deviation) * 100, float(limit_pct) * 100,
+        )
+        return True
+
+    except Exception as _slip_exc:
+        logger.warning(
+            "⚠️ [SLIPPAGE_GUARD] '%s' 슬리페이지 검증 실패 (예외 발생, 허용 처리): %s",
+            symbol, _slip_exc,
+        )
+        return True
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # 🔒 [Phase 6] 동적 Lot Size 헬퍼 — 거래소 Lot Size 기반 수량 quantize 강제
 # ──────────────────────────────────────────────────────────────────────────
 _LOT_SIZE_CACHE: dict = {}  # {symbol: Decimal(step)} 캐시 (1회 결정 후 영속)
+
 
 
 def _get_lot_size_step(
@@ -1705,34 +2001,107 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             if action in ("HOLD", "HOLD_OR_LOW_CONFIDENCE"):
                 return {"status": "hold_or_low_confidence", "confidence": confidence}
 
-            # 6. 📈 [Phase 6] 피라미딩(Pyramiding) 매매 로직 — 추세장 한정 불타기 엔진
+            # 6. 📈 [v5.0] 피라미딩(Pyramiding) 매매 로직 — 시장 국면 동적 제어 엔진
             # ══════════════════════════════════════════════════════════════════════
-            # [가드 완화 정책] 추세장 감지 시 PRICE_BUFFER_PCT를 0.5% → 0.2%로 완화.
-            # [불타기 엔진] 현재 LONG 포지션이 +0.5% 이상 수익권 + BUY 시그널 재발화 시
-            #   → 기존 포지션 수량의 50%를 최대 2회까지 추격 매수 (Redis 카운터 기반 멱등성).
-            # CCXT 호환성과 Decimal 소수점 연산 규칙 완전 준수.
+            # [Regime Classifier 연동]
+            #   추세 국면(TREND): ADX>=25 AND ATR>=240봉 평균ATR×1.5 → 공격성 유지
+            #   횡보 국면(CHOP) : 위 조건 불충족 → 피라미딩 봉쇄, 버퍼 0.5% 상향
+            #   FLAT_HOLD 모드 : 지표 NaN → 신규 진입/불타기 전면 차단
             # ══════════════════════════════════════════════════════════════════════
 
-            # ── [A] 추세장 판정: RSI(14) 40~60 구간 또는 거래량 급등 ──────────────
-            # predict_with_confidence()와 동일한 기준을 재사용하여 일관성 유지.
-            _in_trend_mode = False
+            # ── [A] 시장 국면 판독기(Regime Classifier) 실행 ──────────────────────
+            # OHLCV DataFrame 재구성: WebSocket 큐 우선, 부족 시 DB 데이터 재활용
+            _regime_df: pd.DataFrame | None = None
             try:
-                _latest_rsi = float(latest.rsi_14) if latest.rsi_14 is not None else 50.0
-                if 40.0 <= _latest_rsi <= 60.0:
-                    _in_trend_mode = True
-                    logger.info(
-                        "📈 [TREND_MODE] RSI=%.1f (40~60) 추세 구간 감지 "
-                        "→ 피라미딩 가드 0.5%%→0.2%% 완화",
-                        _latest_rsi,
-                    )
-            except (TypeError, ValueError):
-                pass
+                if _ohlcv_stream is not None and _ohlcv_stream.is_alive(symbol):
+                    _regime_df = _ohlcv_stream.get_latest_df(symbol=symbol, min_candles=60)
+                    if _regime_df is not None:
+                        from worker.indicators import compute_all_features as _caf_regime
+                        _regime_df = _caf_regime(_regime_df)
+            except Exception as _regime_df_exc:
+                logger.warning("⚠️ [REGIME] WebSocket 큐 DataFrame 조회 실패 → DB 폴백: %s", _regime_df_exc)
+                _regime_df = None
 
-            # ── [B] 피라미딩 가드 임계치 동적 적용 ──────────────────────────────
-            PRICE_BUFFER_PCT = (
-                PRICE_BUFFER_PCT_TREND if _in_trend_mode
-                else PRICE_BUFFER_PCT_DEFAULT
-            )
+            # WebSocket 큐 미성숙 또는 실패 시 DB 기록으로 폴백
+            if _regime_df is None:
+                try:
+                    _fallback_rows = (
+                        session.query(MarketData)
+                        .filter(MarketData.symbol == symbol)
+                        .order_by(desc(MarketData.timestamp))
+                        .limit(500)
+                        .all()
+                    )
+                    if len(_fallback_rows) >= 30:
+                        _fallback_rows.reverse()  # oldest → newest
+                        _df_fallback = pd.DataFrame([
+                            {
+                                "timestamp_ms": int(
+                                    _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
+                                    if _r.timestamp.tzinfo else
+                                    _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
+                                ),
+                                "open":   float(_r.open),
+                                "high":   float(_r.high),
+                                "low":    float(_r.low),
+                                "close":  float(_r.close),
+                                "volume": float(_r.volume),
+                            }
+                            for _r in _fallback_rows
+                        ])
+                        _df_fallback = _df_fallback.sort_values(
+                            "timestamp_ms", ascending=True
+                        ).reset_index(drop=True)
+                        from worker.indicators import compute_all_features as _caf_fallback
+                        _regime_df = _caf_fallback(_df_fallback)
+                except Exception as _fb_exc:
+                    logger.warning("⚠️ [REGIME] DB 폴백 DataFrame 구성 실패: %s", _fb_exc)
+                    _regime_df = None
+
+            # 국면 판독 실행
+            _regime: str = "FLAT_HOLD"
+            _regime_meta: dict = {"reason": "DataFrame 미구성 → FLAT_HOLD 보수 처리"}
+            if _regime_df is not None and len(_regime_df) > 0:
+                _regime, _regime_meta = _classify_market_regime(
+                    df=_regime_df,
+                    adx_threshold=ADX_TREND_THRESHOLD,
+                    atr_ratio=ATR_EXPANSION_RATIO,
+                    atr_lookback=ATR_LOOKBACK_CANDLES,
+                )
+            else:
+                logger.warning("⚠️ [REGIME] DataFrame 미구성 → FLAT_HOLD 보수 처리 (신규 진입 차단)")
+
+            # ── [FLAT_HOLD 모드 분기] 지표 NaN → 신규 진입/불타기 전면 차단 ──────────
+            # 하드 손절 가드(HARD_SL_THRESHOLD)는 이미 상위 current_position 블록에서
+            # 처리되었으므로 해당 로직은 FLAT_HOLD에서도 정상 작동합니다.
+            if _regime == "FLAT_HOLD":
+                logger.warning(
+                    "🛑 [FLAT_HOLD] 최고 보수 모드 발동 — 신규 진입/불타기 전면 차단: %s",
+                    _regime_meta.get("reason", ""),
+                )
+                return {
+                    "status": "flat_hold_mode",
+                    "reason": _regime_meta.get("reason", "NaN Failsafe"),
+                    "symbol": symbol,
+                }
+
+            # ── [B] 피라미딩 가드 임계치 동적 바인딩 ─────────────────────────────────
+            # 국면 판정 결과에 따라 PRICE_BUFFER_PCT 및 PYRAMID_MAX_ADDS를 동적으로 가변 바인딩.
+            # 모듈 레벨 상수를 직접 변경하지 않고 로컬 변수로 섀도잉하여 스레드 안전성 보장.
+            if _regime == "TREND":
+                _effective_buffer_pct   = PRICE_BUFFER_PCT_TREND    # 0.2% (공격적)
+                _effective_pyramid_max  = PYRAMID_MAX_ADDS           # 2회 (Phase 6 원본)
+            else:  # CHOP
+                _effective_buffer_pct   = PRICE_BUFFER_PCT_CHOP     # 0.5% (보수적)
+                _effective_pyramid_max  = PYRAMID_MAX_ADDS_CHOP     # 0회 (전면 봉쇄)
+                logger.info(
+                    "🌀 [REGIME/CHOP] 횡보 국면 파라미터 적용: 버퍼=%.1f%%, 불타기 최대=%d회",
+                    float(_effective_buffer_pct) * 100, _effective_pyramid_max,
+                )
+
+            # PRICE_BUFFER_PCT 로컬 별칭 (기존 하위 로직과 동일 변수명 호환)
+            PRICE_BUFFER_PCT = _effective_buffer_pct
+
             
             # 최근 5분 이내 동일 방향 거래 이력 조회
             cooldown_cutoff = now_utc - timedelta(minutes=COOLDOWN_MINUTES)
@@ -1787,9 +2156,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                             "⚠️ [불타기 엔진] Redis 카운터 조회 실패 → 불타기 스킵 (안전 처리): %s",
                             _pyr_redis_exc,
                         )
-                        _pyr_count = PYRAMID_MAX_ADDS  # 실패 시 한도 도달로 간주 → 스킵
+                        _pyr_count = _effective_pyramid_max  # 실패 시 한도 도달로 간주 → 스킵
 
-                    if _pyr_count < PYRAMID_MAX_ADDS:
+                    if _pyr_count < _effective_pyramid_max:
                         # 추격 매수 수량: 현재 포지션 수량의 PYRAMID_ADD_RATIO(50%)
                         _add_amount = pos_contracts * PYRAMID_ADD_RATIO
                         # Decimal 정밀 반올림 (소수점 8자리 — CCXT float 변환 안전)
@@ -1800,7 +2169,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                                 "🔥 [불타기 엔진] LONG 포지션 ROI=%.2f%% (≥ +0.5%%) — "
                                 "추격 매수 %d/%d회: %s BTC (기존 포지션 %.4f BTC의 50%%)",
                                 float(_long_roi) * 100,
-                                _pyr_count + 1, PYRAMID_MAX_ADDS,
+                                _pyr_count + 1, _effective_pyramid_max,
                                 _add_amount, float(pos_contracts),
                             )
                             _pyr_result: OrderResult = _execute_order_pipeline(
@@ -1843,7 +2212,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                                 f"• <b>현재 ROI:</b> <code>{float(_long_roi)*100:+.2f}%</code>\n"
                                 f"• <b>추격 수량:</b> <code>{float(_pyr_rec_amount):.4f} BTC</code>\n"
                                 f"• <b>체결가:</b> <code>${float(_pyr_result['filled_price']):,.2f}</code>\n"
-                                f"• <b>횟수:</b> <code>{_pyr_count + 1}/{PYRAMID_MAX_ADDS}회</code>\n"
+                                f"• <b>횟수:</b> <code>{_pyr_count + 1}/{_effective_pyramid_max}회</code>\n"
                                 f"• <b>상태:</b> <code>{_pyr_result['status']}</code>\n"
                                 f"━━━━━━━━━━━━━━━━━━━━"
                             )
@@ -1861,10 +2230,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                                 "(계산 수량=%s < MIN=%s)",
                                 _add_amount, MIN_ORDER_BTC,
                             )
-                    else:
                         logger.info(
                             "🔒 [불타기 엔진] 최대 횟수(%d회) 도달 → 추격 매수 한도 초과 스킵",
-                            PYRAMID_MAX_ADDS,
+                            _effective_pyramid_max,
                         )
                 else:
                     logger.debug(
@@ -1979,7 +2347,58 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 )
                 return {"status": "insufficient_calculated_amount"}
 
+            # ── [v5.0 방화벽 A] 자본 방화벽 — 신규 진입 주문에만 적용 ──────────────────
+            # 청산(EXIT) 및 피라미딩 주문은 이미 위 불타기 엔진에서 반환됐으므로 여기서는
+            # SNIPER_LONG_ENTRY / SNIPER_SHORT_ENTRY 케이스만 도달합니다.
+            if trigger_type in ("SNIPER_LONG_ENTRY", "SNIPER_SHORT_ENTRY"):
+                _order_usdt_val = calculated_amount * current_close
+                if not _check_capital_guard(
+                    symbol=symbol,
+                    order_usdt_value=_order_usdt_val,
+                    usdt_free=usdt_free,
+                    max_pct=MAX_CAPITAL_PER_SYMBOL_PCT,
+                ):
+                    notifier.send_message(
+                        f"🚨 <b>[CAPITAL_GUARD] 자본 방화벽 작동 — 주문 거부</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>심볼:</b> <code>{symbol}</code>\n"
+                        f"• <b>트리거:</b> <code>{trigger_type}</code>\n"
+                        f"• <b>주문액:</b> <code>${float(_order_usdt_val):,.2f} USDT</code>\n"
+                        f"• <b>한도:</b> <code>${float(usdt_free * MAX_CAPITAL_PER_SYMBOL_PCT):,.2f} USDT "
+                        f"(가용 마진 {float(MAX_CAPITAL_PER_SYMBOL_PCT)*100:.0f}%)</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    return {
+                        "status": "capital_guard_rejected",
+                        "trigger_type": trigger_type,
+                        "order_usdt_value": str(_order_usdt_val),
+                    }
+
+                # ── [v5.0 방화벽 B] 슬리페이지 가드 ──────────────────────────────────
+                if not _check_slippage_guard(
+                    exchange=exchange,
+                    symbol=symbol,
+                    ref_price=current_close,
+                    side=action,
+                    limit_pct=SLIPPAGE_GUARD_PCT,
+                ):
+                    notifier.send_message(
+                        f"🚨 <b>[SLIPPAGE_GUARD] 슬리페이지 초과 — 주문 REJECTED</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>심볼:</b> <code>{symbol}</code>\n"
+                        f"• <b>트리거:</b> <code>{trigger_type}</code>\n"
+                        f"• <b>기준가:</b> <code>${float(current_close):,.2f}</code>\n"
+                        f"• <b>허용 슬리페이지:</b> <code>{float(SLIPPAGE_GUARD_PCT)*100:.1f}%</code>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━"
+                    )
+                    return {
+                        "status": "slippage_guard_rejected",
+                        "trigger_type": trigger_type,
+                        "ref_price": str(current_close),
+                    }
+
             # 8. 🚀 [Phase 3] 프로덕션 등급 주문 집행 파이프라인 호출 (스나이퍼/역시그널)
+
             logger.info(f"🚀 [{trigger_type}] 주문 집행 파이프라인 진입: {action} {calculated_amount} BTC")
 
             exec_result: OrderResult = _execute_order_pipeline(

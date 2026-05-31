@@ -17,6 +17,7 @@ Phase 6 (Numpy 고속화):
   [모멘텀 Momentum]   RSI(14), Stochastic Oscillator(%K,%D)
   [변동성 Volatility] Bollinger Bands(20,2), SMA(20), ATR(14)
   [거래량 Volume]     Volume MA Ratio(20)
+  [국면 Regime]       ADX(14) — 시장 국면 판독기 전용 (Numpy Wilder 스무딩)
 """
 
 import logging
@@ -147,6 +148,96 @@ def _compute_atr_numpy(
     return _wilder_smooth(tr_full, period)
 
 
+def _compute_adx_numpy(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """
+    ADX(Average Directional Index) — 순수 Numpy Wilder 스무딩 구현.
+
+    [시장 국면 판독기(Regime Classifier) 전용 지표]
+    외부 ta 라이브러리 완전 배제, 기존 _wilder_smooth() 인프라 재활용.
+
+    파이프라인:
+        DM+ = max(High - PrevHigh, 0)  (단, DM- > DM+이면 0)
+        DM- = max(PrevLow - Low,  0)  (단, DM+ > DM-이면 0)
+        TR  = max(H-L, |H-Cp|, |L-Cp|)  — _compute_atr_numpy와 동일
+        ATR = Wilder(TR, period)
+        +DI = 100 × Wilder(DM+, period) / ATR
+        -DI = 100 × Wilder(DM-, period) / ATR
+        DX  = 100 × |+DI - -DI| / (+DI + -DI)
+        ADX = Wilder(DX, period)
+
+    Args:
+        high:   고가 배열 (float64)
+        low:    저가 배열 (float64)
+        close:  종가 배열 (float64)
+        period: 스무딩 주기 (기본: 14)
+
+    Returns:
+        ADX 배열 (첫 2*period-1 원소는 NaN, 입력과 동일 shape)
+    """
+    n = len(close)
+    if n < 2:
+        return np.full(n, np.nan, dtype=np.float64)
+
+    # ── True Range (TR) 벡터화 ───────────────────────────────────────────
+    prev_close = close[:-1]       # shape: (n-1,)
+    curr_high  = high[1:]         # shape: (n-1,)
+    curr_low   = low[1:]          # shape: (n-1,)
+    prev_high  = high[:-1]        # shape: (n-1,)
+    prev_low   = low[:-1]         # shape: (n-1,)
+
+    tr = np.maximum(
+        curr_high - curr_low,
+        np.maximum(
+            np.abs(curr_high - prev_close),
+            np.abs(curr_low  - prev_close),
+        ),
+    )
+
+    # ── Directional Movement (DM+, DM-) 벡터화 ───────────────────────────
+    up_move   = curr_high - prev_high   # 현재 고점 - 이전 고점
+    down_move = prev_low  - curr_low    # 이전 저점 - 현재 저점
+
+    # DM+ : up_move > down_move AND up_move > 0 이면 up_move, 나머지 0
+    dm_plus = np.where(
+        (up_move > down_move) & (up_move > 0), up_move, 0.0
+    ).astype(np.float64)
+
+    # DM- : down_move > up_move AND down_move > 0 이면 down_move, 나머지 0
+    dm_minus = np.where(
+        (down_move > up_move) & (down_move > 0), down_move, 0.0
+    ).astype(np.float64)
+
+    # ── NaN 패딩 (원본 배열과 shape 맞춤) ────────────────────────────────
+    tr_full     = np.empty(n, dtype=np.float64); tr_full[0]     = np.nan; tr_full[1:]     = tr
+    dm_plus_full = np.empty(n, dtype=np.float64); dm_plus_full[0] = np.nan; dm_plus_full[1:] = dm_plus
+    dm_minus_full = np.empty(n, dtype=np.float64); dm_minus_full[0] = np.nan; dm_minus_full[1:] = dm_minus
+
+    # ── Wilder 스무딩 적용 ────────────────────────────────────────────────
+    atr_smooth    = _wilder_smooth(tr_full,     period)
+    dm_plus_sm    = _wilder_smooth(dm_plus_full, period)
+    dm_minus_sm   = _wilder_smooth(dm_minus_full, period)
+
+    # ── DI+, DI- 산출 (0 나눗셈 방어: ATR == 0 → NaN) ────────────────────
+    with np.errstate(invalid='ignore', divide='ignore'):
+        di_plus  = np.where(atr_smooth > 0, 100.0 * dm_plus_sm  / atr_smooth, np.nan)
+        di_minus = np.where(atr_smooth > 0, 100.0 * dm_minus_sm / atr_smooth, np.nan)
+
+    # ── DX 산출 (DI+ + DI- == 0 → NaN) ──────────────────────────────────
+    di_sum  = di_plus + di_minus
+    di_diff = np.abs(di_plus - di_minus)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        dx = np.where(di_sum > 0, 100.0 * di_diff / di_sum, np.nan)
+
+    # ── ADX = Wilder 스무딩(DX, period) ─────────────────────────────────
+    adx = _wilder_smooth(dx, period)
+    return adx
+
+
 def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     """
     OHLCV DataFrame에 15종 기술적 지표 피처를 벡터 연산으로 추가합니다.
@@ -252,6 +343,12 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     # 사용하여 동일한 결과를 약 10~50배 빠르게 도출합니다.
     df["atr_14"] = _compute_atr_numpy(high_np, low_np, close_np, period=14)
 
+    # ── [v5.0 Regime Classifier] ADX(14) — 시장 국면 판독기 전용 ──────────
+    # 순수 Numpy Wilder 스무딩 기반. 외부 ta 라이브러리 완전 배제.
+    # DM+/DM-/TR → Wilder 스무딩 → DI+/DI- → DX → ADX 파이프라인.
+    # 추세 국면 판정: ADX ≥ 25 (ADX_TREND_THRESHOLD)
+    df["adx_14"] = _compute_adx_numpy(high_np, low_np, close_np, period=14)
+
     # Volume MA Ratio (당일 거래량 / 20일 거래량 이동평균)
     #   > 1.0 → 평균 이상의 거래량 에너지 (돌파 시그널 강화)
     #   < 1.0 → 평균 이하의 거래량 (시그널 약화)
@@ -259,9 +356,9 @@ def compute_all_features(df: pd.DataFrame) -> pd.DataFrame:
     df["volume_ma_ratio"] = volume / vma_20
 
     logger.debug(
-        "📊 [indicators] 피처 연산 완료: %d행 × %d 피처 (ATR 포함)",
+        "📊 [indicators] 피처 연산 완료: %d행 × %d 피처 (ATR + ADX 포함)",
         len(df),
-        len(FEATURE_COLUMNS) + 1,  # +1: atr_14
+        len(FEATURE_COLUMNS) + 2,  # +2: atr_14, adx_14
     )
     return df
 

@@ -39,8 +39,8 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # ── WebSocket 엔드포인트 (Binance Futures USDM) ─────────────────────────
-_WS_BASE_URL = "wss://fstream.binance.com/ws"
-_WS_DEMO_URL = "wss://fstream-demo.binance.com/ws"
+_WS_BASE_URL = "wss://fstream.binance.com/market/ws"
+_WS_DEMO_URL = "wss://fstream.binancefuture.com/market/ws"
 
 # ── 재연결 정책 (Exponential Backoff) ────────────────────────────────────
 _RECONNECT_MIN_SEC   = 1     # 첫 재연결 대기 (초)

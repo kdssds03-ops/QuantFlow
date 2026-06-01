@@ -24,6 +24,7 @@ Phase 6 (Zero-I/O Latency & Numpy 고속화):
 """
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -76,6 +77,18 @@ from core.notifier import notifier
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
+
+# ── [최적화 ②] 모듈 레벨 Redis 싱글턴 — 매 호출마다 연결을 새로 생성하지 않음 ──────
+# analyze_and_trade() 내 분산락·피라미딩 카운터·리셋에서 이 클라이언트를 공유합니다.
+try:
+    _r_sync = _sync_redis_lib.Redis.from_url(
+        settings.redis_url, decode_responses=True, socket_connect_timeout=2
+    )
+    _r_sync.ping()  # 연결 사전 검증
+    logger.info("✅ [Redis 싱글턴] 모듈 레벨 Redis 클라이언트 초기화 완료")
+except Exception as _r_sync_init_exc:
+    _r_sync = None
+    logger.warning("⚠️ [Redis 싱글턴] 초기화 실패 → 각 호출부에서 개별 생성으로 폴백: %s", _r_sync_init_exc)
 
 # ── 동기 DB 엔진 구성 ──────────────────────────────────────────────────
 _sync_engine = create_engine(
@@ -137,7 +150,8 @@ _WELCOME_REDIS_KEY = "quantflow:welcome_sent_flag"
 _welcome_already_sent = False
 
 try:
-    _r_welcome = _sync_redis_lib.Redis.from_url(
+    # 싱글턴 클라이언트가 준비되어 있으면 재사용, 아니면 임시 연결
+    _r_welcome = _r_sync if _r_sync is not None else _sync_redis_lib.Redis.from_url(
         settings.redis_url, decode_responses=True, socket_connect_timeout=2
     )
     # Redis의 set(..., nx=True) 원자적 연산을 사용하여 단 하나의 컨테이너만 발송 성공하도록 보장
@@ -1221,11 +1235,12 @@ def _run_async_safe(coro):
 def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
     """
     봇 재시작 시 DB에 저장된 최근 lookback 개 캔들을 읽어
-    compute_all_features()로 지표를 재계산하고, 지표값이 NULL인 레코드를 일괄 upsert.
+    compute_all_features()로 지표를 재계산하고, 지표값이 NULL인 레코드를
+    **1회 Bulk Upsert**로 일괄 저장합니다.
 
-    ── 해결하는 문제 ──────────────────────────────────────────────────────────
-    봇 최초 기동 또는 재시작 직후에 메모리 큐가 비어 있어 발생하는 초기 NaN 루프를
-    DB에 이미 누적된 과거 데이터를 활용하여 즉시 해소합니다.
+    ── [최적화 ①] N+1 쿼리 → 1회 Bulk Upsert ───────────────────────────────
+    기존: rows 개수(최대 500)만큼 개별 pg_insert 실행 → DB 500번 왕복
+    변경: NULL 지표 레코드를 리스트로 모아 execute() 1회로 일괄 처리
 
     Returns:
         upsert된 레코드 수
@@ -1236,7 +1251,6 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
     try:
         session = _SyncSession()
         try:
-            from sqlalchemy import asc
             rows = (
                 session.query(MarketData)
                 .filter(MarketData.symbol == symbol)
@@ -1255,96 +1269,86 @@ def _warmup_from_db(symbol: str = "BTC/USDT", lookback: int = 500) -> int:
         rows.reverse()
 
         # ── 타임존 방어 코드: DB 레코드의 timestamp를 UTC-aware로 정규화 ──────
-        # PostgreSQL DateTime(timezone=True) 컬럼은 timezone-aware를 반환하지만,
-        # 혹시 naive datetime이 섞여 있을 경우를 대비하여 강제 정규화
         def _normalize_ts(ts: datetime) -> datetime:
             if ts is None:
                 return ts
             if ts.tzinfo is None:
-                # naive datetime → UTC로 가정하고 tz 부여
                 return ts.replace(tzinfo=timezone.utc)
-            # timezone-aware이면 UTC로 변환
             return ts.astimezone(timezone.utc)
 
         # DataFrame 재구성 (OHLCV만 — 지표는 재계산)
-        df_rows = []
-        for r in rows:
-            df_rows.append({
+        df_rows = [
+            {
                 "timestamp_ms": int(_normalize_ts(r.timestamp).timestamp() * 1000),
                 "open":   float(r.open),
                 "high":   float(r.high),
                 "low":    float(r.low),
                 "close":  float(r.close),
                 "volume": float(r.volume),
-            })
+            }
+            for r in rows
+        ]
 
         df = pd.DataFrame(df_rows)
-
-        # ── compute_all_features: 연속 시계열 정렬 검증 ──────────────────────
-        # timestamp_ms 컬럼으로 정렬하여 시간 불연속(타임존 혼재로 인한 순서 역전) 방지
         df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
 
         from worker.indicators import compute_all_features
         df = compute_all_features(df)
 
-
-        # [Phase 6] compute_all_features()가 ATR/MACD를 포함하여 모든 지표를 단일 호출로 산출.
-        # ta 라이브러리 호출 제거 — 중복 계산 및 GIL 직렬 루프 완전 차단.
-
-
-        # ── NULL 지표 레코드만 선별하여 upsert ──────────────────────────────
-        upsert_count = 0
+        # ── [최적화 ①] NULL 지표 레코드를 리스트로 수집 후 Bulk Upsert ──────────
+        # 기존 방식: 레코드마다 개별 session.execute() → N번 DB 왕복
+        # 변경 방식: values_list에 모아서 단 1번의 execute()로 일괄 처리
+        values_list = []
         for i, r in enumerate(rows):
-            row_feat = df.iloc[i]
-            sma_20_val   = _to_dec(row_feat.get("sma_20"))
-            rsi_14_val   = _to_dec(row_feat.get("rsi_14"))
-            bb_upper_val = _to_dec(row_feat.get("bb_upper"))
-            bb_lower_val = _to_dec(row_feat.get("bb_lower"))
-            atr_14_val      = _to_dec(row_feat.get("atr_14"))
-            macd_line_val   = _to_dec(row_feat.get("macd_line"))
-            macd_signal_val = _to_dec(row_feat.get("macd_signal"))
-            macd_hist_val   = _to_dec(row_feat.get("macd_hist"))
-
-            # 지표가 NULL인 행만 upsert (정상 행 불필요한 재기록 방지)
+            # 지표가 NULL인 행만 대상 (정상 행 불필요한 재기록 방지)
             if r.rsi_14 is None or r.bb_upper is None or r.bb_lower is None or getattr(r, 'atr_14', None) is None:
-                ts_utc = _normalize_ts(r.timestamp)
-                stmt = pg_insert(MarketData).values(
-                    timestamp=ts_utc,
-                    symbol=symbol,
-                    open=Decimal(str(r.open)),
-                    high=Decimal(str(r.high)),
-                    low=Decimal(str(r.low)),
-                    close=Decimal(str(r.close)),
-                    volume=Decimal(str(r.volume)),
-                    sma_20=sma_20_val,
-                    rsi_14=rsi_14_val,
-                    bb_upper=bb_upper_val,
-                    bb_lower=bb_lower_val,
-                    atr_14=atr_14_val,
-                    macd_line=macd_line_val,
-                    macd_signal=macd_signal_val,
-                    macd_hist=macd_hist_val,
-                ).on_conflict_do_update(
-                    constraint="uq_market_data_ts_symbol",
-                    set_={
-                        "sma_20":   pg_insert(MarketData).excluded.sma_20,
-                        "rsi_14":   pg_insert(MarketData).excluded.rsi_14,
-                        "bb_upper": pg_insert(MarketData).excluded.bb_upper,
-                        "bb_lower": pg_insert(MarketData).excluded.bb_lower,
-                        "atr_14":   pg_insert(MarketData).excluded.atr_14,
-                        "macd_line": pg_insert(MarketData).excluded.macd_line,
-                        "macd_signal": pg_insert(MarketData).excluded.macd_signal,
-                        "macd_hist": pg_insert(MarketData).excluded.macd_hist,
-                    },
-                )
-                for session in _get_sync_session():
-                    session.execute(stmt)
-                upsert_count += 1
+                row_feat = df.iloc[i]
+                values_list.append({
+                    "timestamp": _normalize_ts(r.timestamp),
+                    "symbol":    symbol,
+                    "open":      Decimal(str(r.open)),
+                    "high":      Decimal(str(r.high)),
+                    "low":       Decimal(str(r.low)),
+                    "close":     Decimal(str(r.close)),
+                    "volume":    Decimal(str(r.volume)),
+                    "sma_20":    _to_dec(row_feat.get("sma_20")),
+                    "rsi_14":    _to_dec(row_feat.get("rsi_14")),
+                    "bb_upper":  _to_dec(row_feat.get("bb_upper")),
+                    "bb_lower":  _to_dec(row_feat.get("bb_lower")),
+                    "atr_14":    _to_dec(row_feat.get("atr_14")),
+                    "macd_line":    _to_dec(row_feat.get("macd_line")),
+                    "macd_signal":  _to_dec(row_feat.get("macd_signal")),
+                    "macd_hist":    _to_dec(row_feat.get("macd_hist")),
+                })
 
-        logger.info(
-            "✅ [DB Warm-up] 완료 — 처리 %d봉, 지표 upsert %d건",
-            len(rows), upsert_count
-        )
+        upsert_count = len(values_list)
+        if values_list:
+            # 단 1회 execute — DB 왕복을 최대 500회에서 1회로 단축
+            bulk_stmt = pg_insert(MarketData).values(values_list).on_conflict_do_update(
+                constraint="uq_market_data_ts_symbol",
+                set_={
+                    "sma_20":      pg_insert(MarketData).excluded.sma_20,
+                    "rsi_14":      pg_insert(MarketData).excluded.rsi_14,
+                    "bb_upper":    pg_insert(MarketData).excluded.bb_upper,
+                    "bb_lower":    pg_insert(MarketData).excluded.bb_lower,
+                    "atr_14":      pg_insert(MarketData).excluded.atr_14,
+                    "macd_line":   pg_insert(MarketData).excluded.macd_line,
+                    "macd_signal": pg_insert(MarketData).excluded.macd_signal,
+                    "macd_hist":   pg_insert(MarketData).excluded.macd_hist,
+                },
+            )
+            for session in _get_sync_session():
+                session.execute(bulk_stmt)
+            logger.info(
+                "✅ [DB Warm-up] Bulk Upsert 완료 — 처리 %d봉, 지표 upsert %d건 (DB 왕복 1회)",
+                len(rows), upsert_count
+            )
+        else:
+            logger.info(
+                "✅ [DB Warm-up] 완료 — 처리 %d봉, NULL 지표 없음 (upsert 불필요)",
+                len(rows)
+            )
+
         return upsert_count
 
     except Exception as exc:
@@ -1432,6 +1436,10 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         # 변경: compute_all_features()에 ATR 통합 — 순수 Numpy Wilder 스무딩
         df = compute_all_features(df)
 
+        # [최적화 ③] 계산 결과를 Redis 60초 캐시에 저장
+        # → analyze_and_trade의 Regime Classifier가 동일 데이터로 중복 계산하지 않도록
+        _set_cached_features(symbol, df)
+
         last = df.iloc[-1]
         candle_dt = _ensure_utc(int(last["timestamp_ms"]))
 
@@ -1503,6 +1511,55 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
 
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# [최적화 ③] compute_all_features Redis 60초 캐시 헬퍼
+# ──────────────────────────────────────────────────────────────────────────
+_FEATURES_CACHE_KEY_PREFIX = "quantflow:features_cache:"
+_FEATURES_CACHE_TTL_SEC    = 60  # 60초 TTL — 1분봉 주기에 맞춰 스테일 데이터 방지
+
+
+def _get_cached_features(symbol: str) -> "pd.DataFrame | None":
+    """
+    Redis에서 60초 캐시된 compute_all_features() 결과를 조회합니다.
+
+    fetch_market_data_task가 이미 동일 데이터로 피처를 계산했을 때
+    analyze_and_trade의 Regime Classifier가 중복 계산하지 않도록 방지합니다.
+
+    Returns:
+        캐시 적중 시 DataFrame, 미스 또는 오류 시 None
+    """
+    if _r_sync is None:
+        return None
+    try:
+        key = f"{_FEATURES_CACHE_KEY_PREFIX}{_normalize_symbol(symbol)}"
+        cached_json = _r_sync.get(key)
+        if cached_json is None:
+            return None
+        records = json.loads(cached_json)
+        df = pd.DataFrame(records)
+        logger.debug("⚡ [Features 캐시] Redis 캐시 HIT — symbol=%s, rows=%d", symbol, len(df))
+        return df
+    except Exception as _cache_exc:
+        logger.warning("⚠️ [Features 캐시] 조회 실패 (재계산 진행): %s", _cache_exc)
+        return None
+
+
+def _set_cached_features(symbol: str, df: "pd.DataFrame") -> None:
+    """
+    compute_all_features() 결과를 Redis에 60초 TTL로 캐시합니다.
+    직렬화 실패 시 조용히 무시하여 캐시 계층이 핵심 로직을 방해하지 않습니다.
+    """
+    if _r_sync is None:
+        return
+    try:
+        key = f"{_FEATURES_CACHE_KEY_PREFIX}{_normalize_symbol(symbol)}"
+        # float 변환으로 JSON 직렬화 가능하게 처리 (NaN → null)
+        records = df.where(pd.notnull(df), None).to_dict(orient="records")
+        _r_sync.setex(key, _FEATURES_CACHE_TTL_SEC, json.dumps(records))
+        logger.debug("💾 [Features 캐시] Redis 캐시 SET — symbol=%s, rows=%d, TTL=%ds",
+                     symbol, len(df), _FEATURES_CACHE_TTL_SEC)
+    except Exception as _cache_exc:
+        logger.warning("⚠️ [Features 캐시] 저장 실패 (무시): %s", _cache_exc)
 
 
 # ─────────────────────────────────────────────
@@ -1515,21 +1572,22 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
     max_retries=2,
     default_retry_delay=10,
 )
-def analyze_and_trade(self, symbol: str = "BTC/USDT"):
+def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
     logger.info(f"🧠 QuantFlow 하이브리드 의사결정 엔진 가동: {symbol}")
 
     # ── [결함 #1 수정] 심볼별 Redis 분산 락 — 중복 트리거 즉시 차단 ──────────
-    # SETNX (SET if Not eXists): 락이 이미 존재하면 0 반환 → 즉시 Skip.
-    # TTL = 30초: 정상 주문 집행 후 락이 자동 만료되어 다음 신호를 수신할 수 있음.
-    # 이 가드는 동일 시그널이 10여 초 간격으로 2번 발화되는 중복 실행을 원천 차단.
+    # [최적화 ②] 모듈 레벨 싱글턴 _r_sync 공유 (반복 연결 생성 제거)
     _lock_key = f"{_ORDER_DEDUP_LOCK_PREFIX}{_normalize_symbol(symbol)}"
+    _r_lock = _r_sync  # 싱글턴 재사용
     try:
-        _r_sync = _sync_redis_lib.Redis.from_url(
-            settings.redis_url, decode_responses=True, socket_connect_timeout=2
-        )
+        if _r_lock is None:
+            # 싱글턴 초기화 실패 시에만 임시 연결 생성
+            _r_lock = _sync_redis_lib.Redis.from_url(
+                settings.redis_url, decode_responses=True, socket_connect_timeout=2
+            )
         # NX=True: 키가 없을 때만 SET (원자적 SETNX)
         # EX: TTL(초) 자동 설정 → 워커 크래시 시 락 영구 잠금 방지
-        _lock_acquired = _r_sync.set(_lock_key, "1", nx=True, ex=_ORDER_DEDUP_LOCK_TTL_SEC)
+        _lock_acquired = _r_lock.set(_lock_key, "1", nx=True, ex=_ORDER_DEDUP_LOCK_TTL_SEC)
         if not _lock_acquired:
             logger.warning(
                 "🔒 [중복 주문 방지] '%s' 심볼 락 점유 중 — 이번 트리거 Skip (TTL=%ds)",
@@ -2228,53 +2286,59 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
             # ══════════════════════════════════════════════════════════════════════
 
             # ── [A] 시장 국면 판독기(Regime Classifier) 실행 ──────────────────────
-            # OHLCV DataFrame 재구성: WebSocket 큐 우선, 부족 시 DB 데이터 재활용
-            _regime_df: pd.DataFrame | None = None
-            try:
-                if _ohlcv_stream is not None and _ohlcv_stream.is_alive(symbol):
-                    _regime_df = _ohlcv_stream.get_latest_df(symbol=symbol, min_candles=60)
-                    if _regime_df is not None:
-                        from worker.indicators import compute_all_features as _caf_regime
-                        _regime_df = _caf_regime(_regime_df)
-            except Exception as _regime_df_exc:
-                logger.warning("⚠️ [REGIME] WebSocket 큐 DataFrame 조회 실패 → DB 폴백: %s", _regime_df_exc)
-                _regime_df = None
-
-            # WebSocket 큐 미성숙 또는 실패 시 DB 기록으로 폴백
-            if _regime_df is None:
+            # [최적화 ③] Redis 캐시 우선 조회 → fetch_market_data_task가 이미 계산한 결과 재사용
+            _regime_df: pd.DataFrame | None = _get_cached_features(symbol)
+            if _regime_df is not None:
+                logger.debug("⚡ [REGIME] Redis 캐시 HIT — compute_all_features 중복 계산 생략")
+            else:
+                # 캐시 미스: WebSocket 큐 → DB 순서로 폴백
                 try:
-                    _fallback_rows = (
-                        session.query(MarketData)
-                        .filter(MarketData.symbol == symbol)
-                        .order_by(desc(MarketData.timestamp))
-                        .limit(500)
-                        .all()
-                    )
-                    if len(_fallback_rows) >= 30:
-                        _fallback_rows.reverse()  # oldest → newest
-                        _df_fallback = pd.DataFrame([
-                            {
-                                "timestamp_ms": int(
-                                    _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
-                                    if _r.timestamp.tzinfo else
-                                    _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
-                                ),
-                                "open":   float(_r.open),
-                                "high":   float(_r.high),
-                                "low":    float(_r.low),
-                                "close":  float(_r.close),
-                                "volume": float(_r.volume),
-                            }
-                            for _r in _fallback_rows
-                        ])
-                        _df_fallback = _df_fallback.sort_values(
-                            "timestamp_ms", ascending=True
-                        ).reset_index(drop=True)
-                        from worker.indicators import compute_all_features as _caf_fallback
-                        _regime_df = _caf_fallback(_df_fallback)
-                except Exception as _fb_exc:
-                    logger.warning("⚠️ [REGIME] DB 폴백 DataFrame 구성 실패: %s", _fb_exc)
+                    if _ohlcv_stream is not None and _ohlcv_stream.is_alive(symbol):
+                        _regime_df = _ohlcv_stream.get_latest_df(symbol=symbol, min_candles=60)
+                        if _regime_df is not None:
+                            from worker.indicators import compute_all_features as _caf_regime
+                            _regime_df = _caf_regime(_regime_df)
+                            _set_cached_features(symbol, _regime_df)  # 다음 호출 대비 캐시
+                except Exception as _regime_df_exc:
+                    logger.warning("⚠️ [REGIME] WebSocket 큐 DataFrame 조회 실패 → DB 폴백: %s", _regime_df_exc)
                     _regime_df = None
+
+                # WebSocket 큐 미성숙 또는 실패 시 DB 기록으로 폴백
+                if _regime_df is None:
+                    try:
+                        _fallback_rows = (
+                            session.query(MarketData)
+                            .filter(MarketData.symbol == symbol)
+                            .order_by(desc(MarketData.timestamp))
+                            .limit(500)
+                            .all()
+                        )
+                        if len(_fallback_rows) >= 30:
+                            _fallback_rows.reverse()  # oldest → newest
+                            _df_fallback = pd.DataFrame([
+                                {
+                                    "timestamp_ms": int(
+                                        _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
+                                        if _r.timestamp.tzinfo else
+                                        _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
+                                    ),
+                                    "open":   float(_r.open),
+                                    "high":   float(_r.high),
+                                    "low":    float(_r.low),
+                                    "close":  float(_r.close),
+                                    "volume": float(_r.volume),
+                                }
+                                for _r in _fallback_rows
+                            ])
+                            _df_fallback = _df_fallback.sort_values(
+                                "timestamp_ms", ascending=True
+                            ).reset_index(drop=True)
+                            from worker.indicators import compute_all_features as _caf_fallback
+                            _regime_df = _caf_fallback(_df_fallback)
+                            _set_cached_features(symbol, _regime_df)  # 다음 호출 대비 캐시
+                    except Exception as _fb_exc:
+                        logger.warning("⚠️ [REGIME] DB 폴백 DataFrame 구성 실패: %s", _fb_exc)
+                        _regime_df = None
 
             # 국면 판독 실행
             _regime: str = "FLAT_HOLD"
@@ -2290,8 +2354,6 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 logger.warning("⚠️ [REGIME] DataFrame 미구성 → FLAT_HOLD 보수 처리 (신규 진입 차단)")
 
             # ── [FLAT_HOLD 모드 분기] 지표 NaN → 신규 진입/불타기 전면 차단 ──────────
-            # 하드 손절 가드(HARD_SL_THRESHOLD)는 이미 상위 current_position 블록에서
-            # 처리되었으므로 해당 로직은 FLAT_HOLD에서도 정상 작동합니다.
             if _regime == "FLAT_HOLD":
                 logger.warning(
                     "🛑 [FLAT_HOLD] 최고 보수 모드 발동 — 신규 진입/불타기 전면 차단: %s",
@@ -2360,13 +2422,15 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                 # 롱 포지션 수익률: (현재가 - 진입가) / 진입가
                 _long_roi = (current_close - entry_price) / entry_price
                 if _long_roi >= PYRAMID_PROFIT_THRESHOLD:
-                    # ── Redis 카운터로 불타기 횟수 제한 ──────────────────────
+                    # ── [최적화 ②] 싱글턴 Redis로 카운터 조회 ────────────────
                     _pyr_key = f"{_PYRAMID_COUNT_KEY_PREFIX}{_normalize_symbol(symbol)}"
                     _pyr_count = 0
+                    _r_pyr = _r_sync  # 모듈 레벨 싱글턴 재사용
                     try:
-                        _r_pyr = _sync_redis_lib.Redis.from_url(
-                            settings.redis_url, decode_responses=True, socket_connect_timeout=2
-                        )
+                        if _r_pyr is None:
+                            _r_pyr = _sync_redis_lib.Redis.from_url(
+                                settings.redis_url, decode_responses=True, socket_connect_timeout=2
+                            )
                         _pyr_count_raw = _r_pyr.get(_pyr_key)
                         _pyr_count = int(_pyr_count_raw) if _pyr_count_raw else 0
                     except Exception as _pyr_redis_exc:
@@ -2534,8 +2598,9 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):
                         raw_amount = Decimal("0.001")
                     
                     # [Phase 6] 신규 LONG 진입(BUY) 시 불타기 카운터 Redis 리셋
+                    # [최적화 ②] 싱글턴 클라이언트 재사용
                     try:
-                        _r_reset = _sync_redis_lib.Redis.from_url(
+                        _r_reset = _r_sync if _r_sync is not None else _sync_redis_lib.Redis.from_url(
                             settings.redis_url, decode_responses=True, socket_connect_timeout=2
                         )
                         _r_reset.delete(f"{_PYRAMID_COUNT_KEY_PREFIX}{_normalize_symbol(symbol)}")
@@ -2906,7 +2971,8 @@ def handle_telegram_command(command: str) -> str:
     비동기 세션 데드락 방지를 위해 독립적인 HTTP 소켓(requests)으로 응답을 즉시 선제 발송합니다.
     """
     import redis
-    r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+    # 싱글턴 클라이언트가 준비되어 있으면 재사용
+    r = _r_sync if _r_sync is not None else redis.Redis.from_url(settings.redis_url, decode_responses=True)
     status_key = "quantflow:sys_status"
     
     # 2. 정돈 처리 강화: 전각 문자를 반각으로 변환(NFKC), 공백 제거, 소문자화하여 대소문자 혼용 및 특수문자 방어
@@ -2958,8 +3024,9 @@ def telegram_command_listener_task():
 
     import redis
     import httpx
-    
-    r = redis.Redis.from_url(settings.redis_url, decode_responses=True)
+
+    # [최적화 ②] 싱글턴 클라이언트 재사용
+    r = _r_sync if _r_sync is not None else redis.Redis.from_url(settings.redis_url, decode_responses=True)
     
     last_update_id_key = "quantflow:telegram:last_update_id"
     last_update_id = r.get(last_update_id_key)

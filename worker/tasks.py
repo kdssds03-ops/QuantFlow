@@ -1134,6 +1134,64 @@ def _get_futures_margin_balance(exchange: "ccxt.Exchange") -> tuple[Decimal, Dec
 
 
 # ─────────────────────────────────────────────
+# 🛑 일일 최대손실 서킷브레이커
+# ─────────────────────────────────────────────
+def _check_daily_loss_breaker(current_equity: Decimal) -> bool:
+    """
+    당일(KST) 시작 자본 대비 손실이 settings.max_daily_loss_pct에 도달하면
+    Redis sys_status=PAUSED로 매매를 동결하고 True를 반환한다.
+
+    - 당일 시작 자본은 그날 첫 호출 시 Redis에 SETNX로 1회 기록(KST 날짜별 키, 2일 만료).
+    - 한도(<=0)면 비활성으로 항상 False.
+    - 발동 시 텔레그램 긴급 경고를 1회만 발송하고, 이후 매 호출은 상단 pause 가드가 차단.
+    - 다음 KST 자정에 새 시작 자본이 기록되어 자동 리셋.
+    """
+    try:
+        limit = Decimal(str(settings.max_daily_loss_pct))
+    except (InvalidOperation, TypeError):
+        return False
+    if limit <= Decimal("0") or _r_sync is None:
+        return False
+    try:
+        kst_date = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        key = f"quantflow:day_start_equity:{kst_date}"
+        # 당일 첫 호출이면 시작 자본 기록 (원자적 SETNX, 48h 후 만료)
+        if _r_sync.set(key, str(current_equity), nx=True, ex=172800):
+            day_start = current_equity
+        else:
+            day_start = Decimal(_r_sync.get(key) or str(current_equity))
+        if day_start <= Decimal("0"):
+            return False
+        daily_pnl = (current_equity - day_start) / day_start
+        if daily_pnl <= -limit:
+            already_paused = (_r_sync.get("quantflow:sys_status") == "PAUSED")
+            _r_sync.set("quantflow:sys_status", "PAUSED")
+            if not already_paused:
+                logger.error(
+                    "🛑 [서킷브레이커] 일일 손실 한도 도달 → 매매 동결(PAUSED): "
+                    "당일 시작 %.2f → 현재 %.2f USDT (%.2f%% ≤ -%.2f%%)",
+                    float(day_start), float(current_equity),
+                    float(daily_pnl) * 100, float(limit) * 100,
+                )
+                notifier.send_message(
+                    f"🛑 <b>[QuantFlow] 일일 손실 서킷브레이커 발동</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>당일 손익:</b> <code>{float(daily_pnl)*100:.2f}%</code> "
+                    f"(한도 -{float(limit)*100:.1f}%)\n"
+                    f"• <b>시작 자본:</b> <code>${float(day_start):,.2f}</code>\n"
+                    f"• <b>현재 자본:</b> <code>${float(current_equity):,.2f}</code>\n"
+                    f"• <b>조치:</b> <code>매매 자동 동결(PAUSED)</code>\n"
+                    f"• 재개하려면 텔레그램에 <code>/resume</code> (당일 자정 자동 리셋)\n"
+                    f"━━━━━━━━━━━━━━━━━━━━"
+                )
+            return True
+        return False
+    except Exception as exc:
+        logger.warning("⚠️ [서킷브레이커] 검사 중 예외 (매매 계속): %s", exc)
+        return False
+
+
+# ─────────────────────────────────────────────
 # 🔁 [비동기 DB 헬퍼] 날짜 필터 조회 — async_session 기반
 # ─────────────────────────────────────────────
 async def _async_query_today_trades(symbol: str, start_of_day_naive: datetime) -> list:
@@ -1690,6 +1748,12 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
         except Exception as e:
             logger.error("❌ 실시간 지갑 잔고 조회 최종 실패 (%d회 재시도 소진): %s", _BALANCE_RETRY_MAX, e)
             return {"status": "balance_fetch_failed"}
+
+        # ── [서킷브레이커] 일일 최대손실 도달 시 매매 동결 ──────────────────────
+        # 당일(KST) 시작 자본 대비 손실이 한도 초과면 sys_status=PAUSED로 전환하고 중단.
+        # (한도 미설정 시 비활성 — 기존 동작 영향 없음)
+        if _check_daily_loss_breaker(usdt_balance):
+            return {"status": "daily_loss_breaker_tripped", "symbol": symbol}
 
         for session in _get_sync_session():
             # 2. 최신 시세 데이터 스캔

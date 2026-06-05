@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     # 권장 범위 0.05~0.50. 1.0 초과(레버리지 가중)는 파산 위험이 급증하므로 주의.
     risk_factor: float = 0.10
 
+    # 일일 최대손실 서킷브레이커: 당일(KST) 시작자본 대비 손실이 이 비율에 도달하면
+    # 자동으로 sys_status=PAUSED로 매매를 동결한다. 0 = 비활성(기본).
+    # 예: 0.05 = -5% 도달 시 당일 매매 중단. 실전에서는 0.03~0.10 설정 강력 권장.
+    max_daily_loss_pct: float = 0.0
+
     # ── Logging ──────────────────────────────
     log_level: str = "INFO"
 

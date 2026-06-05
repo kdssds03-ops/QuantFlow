@@ -49,6 +49,12 @@ class Settings(BaseSettings):
     exchange_name: str = "binance"
     exchange_sandbox: bool = False  # True → 테스트넷(샌드박스) 모드
 
+    # ── Strategy ─────────────────────────────
+    # 1회 신규 진입에 투입할 가용 마진 비율 (사이징 = 위험/수익 손잡이).
+    # 백테스트(4h 추세, 3년): 0.10 → 연 ~7%/MDD -8%, 0.30 → 연 ~19%/MDD -22%.
+    # 권장 범위 0.05~0.50. 1.0 초과(레버리지 가중)는 파산 위험이 급증하므로 주의.
+    risk_factor: float = 0.10
+
     # ── Logging ──────────────────────────────
     log_level: str = "INFO"
 

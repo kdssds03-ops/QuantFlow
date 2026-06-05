@@ -225,6 +225,17 @@ COOLDOWN_MINUTES = 5
 STOP_LOSS_THRESHOLD = Decimal("-0.0100") # -1.0% 소프트 손절 방패 (지표 기반)
 # CONFIDENCE_THRESHOLD는 _resolve_predictor() 의존성 때문에 모듈 상단에서 선정의됨 (위 참조)
 
+# ── 진입 사이징 (위험/수익 손잡이) — .env RISK_FACTOR로 조절 ───────────────
+# 신규 진입 1회당 가용 마진의 이 비율을 투입. 기본 0.10(10%).
+# 0 < x <= 1 범위로 클램프하여 잘못된 설정으로 인한 과도 레버리지/0 주문을 방지.
+RISK_FACTOR = Decimal(str(settings.risk_factor))
+if RISK_FACTOR <= Decimal("0") or RISK_FACTOR > Decimal("1"):
+    logger.warning(
+        "⚠️ [RISK_FACTOR] 설정값 %s 이 허용범위(0~1)를 벗어남 → 0.10으로 보정", RISK_FACTOR
+    )
+    RISK_FACTOR = Decimal("0.10")
+logger.info("⚖️ [RISK_FACTOR] 진입 사이징 = 가용 마진의 %.0f%%", float(RISK_FACTOR) * 100)
+
 # ── [Phase 6] 불타기 엔진 설정 ─────────────────────────────────────────────
 # 추세장 한정 피라미딩 가드 완화: 기존 0.5% → 0.2%
 PRICE_BUFFER_PCT_TREND   = Decimal("0.002")  # 추세장 피라미딩 가드 (0.2%)
@@ -2596,7 +2607,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     )
 
             # 7. ⚡ 주문 분기점 정의 및 동적 주문 수량 계산 (Symmetric LONG & SHORT Pipeline)
-            RISK_FACTOR = Decimal("0.1")  # 기본 진입 비중 (10%)
+            # RISK_FACTOR는 모듈 상단에서 .env(settings.risk_factor) 기반으로 정의됨 (위 참조)
             _step = _get_lot_size_step(exchange, symbol, fallback_step="0.001")
             
             # 0 나눗셈 및 math.isnan 방어 가드

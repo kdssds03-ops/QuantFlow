@@ -32,3 +32,6 @@ celerybeat-schedule.db
 # ── OS ──
 .DS_Store
 Thumbs.db
+
+# 대용량 시세 데이터 (재수집 가능 — scripts/fetch_ohlcv.py)
+data/btc_1m_1year.csv

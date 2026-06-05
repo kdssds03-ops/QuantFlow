@@ -73,6 +73,7 @@ class Position:
     entry_idx: int = 0
     peak_roi: float = 0.0
     adds: int = 0
+    entry_regime: str = "?"  # 진입 시점 국면 (손익 귀속 분석용)
 
 
 def classify_regime(adx, atr, atr_avg, p: StrategyParams) -> str:
@@ -122,16 +123,17 @@ def run_backtest(df: pd.DataFrame, p: StrategyParams, initial: float = 10_000.0)
             "entry_price": pos.entry_price, "exit_price": price,
             "qty": pos.qty, "duration": i - pos.entry_idx,
             "pnl": pnl - fee, "reason": reason, "adds": pos.adds,
+            "entry_regime": pos.entry_regime,
         })
         pos = Position()
 
-    def open_position(i, price, side):
+    def open_position(i, price, side, regime):
         nonlocal equity, pos
         notional = equity * p.entry_portion
         qty = notional / price
         fee = notional * p.fee_rate
         equity -= fee
-        pos = Position(side=side, entry_price=price, qty=qty, entry_idx=i)
+        pos = Position(side=side, entry_price=price, qty=qty, entry_idx=i, entry_regime=regime)
         last_entry_bar["BUY" if side == "LONG" else "SELL"] = i
         last_entry_price["BUY" if side == "LONG" else "SELL"] = price
 
@@ -210,7 +212,7 @@ def run_backtest(df: pd.DataFrame, p: StrategyParams, initial: float = 10_000.0)
                 continue
             # 쿨다운/단가 버퍼 가드 (동일방향 재진입 — 신규 진입엔 직전가 없으면 통과)
             side = "LONG" if sig == "BUY" else "SHORT"
-            open_position(i, c, side)
+            open_position(i, c, side, regime)
 
         elif pos.side == "SHORT" and sig == "BUY":
             # 역시그널 숏 청산 (리버스 스위칭) — 가드 면제
@@ -287,7 +289,20 @@ def print_report(label, m, trades):
     cnt, pnl = reason_breakdown(trades)
     print("  청산사유별 :")
     for r in sorted(cnt, key=lambda x: -cnt[x]):
-        print(f"    - {r:<13} {cnt[r]:>3}회  순손익 {pnl[r]:+8.2f} USDT")
+        print(f"    - {r:<13} {cnt[r]:>4}회  순손익 {pnl[r]:+9.2f} USDT")
+    # 진입 국면별 손익 귀속
+    from collections import Counter, defaultdict
+    rc = Counter(t.get("entry_regime", "?") for t in trades)
+    rp = defaultdict(float)
+    rw = defaultdict(int)
+    for t in trades:
+        rp[t.get("entry_regime", "?")] += t["pnl"]
+        if t["pnl"] > 0:
+            rw[t.get("entry_regime", "?")] += 1
+    print("  진입국면별 :")
+    for r in sorted(rc, key=lambda x: -rc[x]):
+        wr = rw[r] / rc[r] * 100 if rc[r] else 0
+        print(f"    - {r:<10} {rc[r]:>4}회  순손익 {rp[r]:+9.2f} USDT  (승률 {wr:.0f}%)")
 
 
 def load_data():

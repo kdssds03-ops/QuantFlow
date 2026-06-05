@@ -5,6 +5,7 @@ pydantic-settings를 통해 .env 파일에서 자동 로드
 
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import model_validator
 
 
 class Settings(BaseSettings):
@@ -20,7 +21,7 @@ class Settings(BaseSettings):
     # ── App ──────────────────────────────────
     app_name: str = "QuantFlow"
     app_env: str = "development"
-    debug: bool = True
+    debug: bool = False
     secret_key: str = "change-me"
     tz: str = "Asia/Seoul"
 
@@ -30,7 +31,7 @@ class Settings(BaseSettings):
     postgres_user: str = "quantflow"
     postgres_password: str = "quantflow"
     postgres_db: str = "quantflow"
-    database_url: str = "postgresql+asyncpg://quantflow:quantflow@postgres:5432/quantflow"
+    database_url: str = ""
 
     # ── Redis ────────────────────────────────
     redis_host: str = "redis"
@@ -51,9 +52,25 @@ class Settings(BaseSettings):
     # ── Logging ──────────────────────────────
     log_level: str = "INFO"
 
+    # ── CORS ─────────────────────────────────
+    # 쉼표로 구분된 허용 오리진 목록. 기본값 "*"(전체 허용)은 개발 편의용이며,
+    # 프로덕션에서는 .env에서 명시적 도메인으로 제한할 것을 강력 권장.
+    # 예) CORS_ALLOW_ORIGINS="https://app.example.com,https://admin.example.com"
+    cors_allow_origins: str = "*"
+
     # ── Telegram ──────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+
+    @model_validator(mode='after')
+    def _assemble_database_url(self) -> 'Settings':
+        """database_url이 명시적으로 설정되지 않으면 개별 필드로 자동 구성"""
+        if not self.database_url:
+            self.database_url = (
+                f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+                f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+            )
+        return self
 
     @property
     def is_production(self) -> bool:
@@ -63,6 +80,14 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         """Alembic 등 동기 드라이버용 URL"""
         return self.database_url.replace("+asyncpg", "+psycopg2")
+
+    @property
+    def cors_origins_list(self) -> list[str]:
+        """쉼표 구분 CORS 오리진 문자열을 리스트로 파싱. '*'는 전체 허용."""
+        raw = (self.cors_allow_origins or "").strip()
+        if raw == "*" or not raw:
+            return ["*"]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
 @lru_cache()

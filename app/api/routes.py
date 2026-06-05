@@ -41,7 +41,8 @@ async def health_check(
         redis_status = f"error: {e}"
 
     # NTP drift
-    drift_ms = check_ntp_drift()
+    import asyncio
+    drift_ms = await asyncio.to_thread(check_ntp_drift)
 
     return {
         "status": "ok",
@@ -51,7 +52,7 @@ async def health_check(
         "components": {
             "database": db_status,
             "redis": redis_status,
-            "ntp_drift_ms": round(drift_ms, 1),
+            "ntp_drift_ms": round(drift_ms, 1) if drift_ms is not None else None,
         },
     }
 

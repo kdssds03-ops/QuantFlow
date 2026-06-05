@@ -14,15 +14,16 @@ logger = logging.getLogger(__name__)
 MAX_DRIFT_MS = 1000
 
 
-def check_ntp_drift() -> float:
+def check_ntp_drift() -> float | None:
     """
     NTP 서버와 로컬 시계의 차이(ms)를 반환.
     3회 재시도 및 다중 NTP 서버 폴백 지원으로 복원력 극대화.
     """
     ntp_servers = ["pool.ntp.org", "time.google.com", "time.windows.com"]
     client = ntplib.NTPClient()
-    
-    for attempt in range(1, 4):
+    total_rounds = 3
+
+    for round_no in range(1, total_rounds + 1):
         for server in ntp_servers:
             try:
                 response = client.request(server, version=3, timeout=2.0)
@@ -37,11 +38,16 @@ def check_ntp_drift() -> float:
                     logger.info(f"✅ NTP 시간 동기화 정상: drift={drift_ms:.1f}ms ({server})")
                 return drift_ms
             except Exception as e:
-                logger.debug(f"NTP 서버 {server} (attempt {attempt}/3) 조회 실패: {e}")
+                logger.debug(
+                    f"NTP 서버 {server} 조회 실패 (라운드 {round_no}/{total_rounds}): {e}"
+                )
         time.sleep(1.0)
-    
-    logger.error("❌ 모든 NTP 서버 조회 실패 (3회 시도 완료)")
-    return 0.0
+
+    logger.error(
+        f"❌ 모든 NTP 서버 조회 실패 "
+        f"({len(ntp_servers) * total_rounds}회 시도: {len(ntp_servers)}서버 × {total_rounds}라운드)"
+    )
+    return None
 
 
 def get_timestamp_ms() -> int:

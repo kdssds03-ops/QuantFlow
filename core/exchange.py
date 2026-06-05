@@ -9,7 +9,7 @@ Phase 5 (Timezone Fix):
 
 import logging
 from datetime import datetime, timezone
-from typing import List
+
 
 import ccxt
 
@@ -73,7 +73,7 @@ def get_exchange() -> ccxt.Exchange:
         exchange.has["fetchCurrencies"] = False
 
         # [3] monkey-patch: [2]를 우회하는 경우에 대한 이중 안전망
-        exchange.fetch_currencies = lambda params={}: {}
+        exchange.fetch_currencies = lambda params=None: {}
 
         # [4] fapi URL 도메인만 교체 (경로 /fapi/v1 유지 필수)
         for api_type, url in list(exchange.urls["api"].items()):
@@ -132,7 +132,7 @@ def fetch_ohlcv_utc(
     symbol: str,
     timeframe: str = "1m",
     limit: int = 500,
-) -> List[list]:
+) -> list[list]:
     """
     ccxt fetch_ohlcv() 래퍼 — UTC timestamp 보장 버전.
 

@@ -38,8 +38,12 @@ async def lifespan(app: FastAPI):
         logger.info("📦 DB 테이블 생성 완료 (debug 모드)")
 
     # NTP 시간 차이 확인
-    drift = check_ntp_drift()
-    logger.info(f"⏱  NTP drift: {drift:.1f}ms")
+    import asyncio
+    drift = await asyncio.to_thread(check_ntp_drift)
+    if drift is not None:
+        logger.info(f"⏱  NTP drift: {drift:.1f}ms")
+    else:
+        logger.warning("⏱  NTP drift: 측정 불가 (모든 NTP 서버 응답 없음)")
 
     yield
 
@@ -60,10 +64,20 @@ app = FastAPI(
 )
 
 # ── CORS ─────────────────────────────────────
+# 허용 오리진은 settings(.env CORS_ALLOW_ORIGINS)에서 로드.
+# 와일드카드("*") 사용 시 브라우저 사양상 credentials를 함께 허용할 수 없으므로,
+# 오리진이 명시적으로 제한된 경우에만 allow_credentials=True 로 활성화한다.
+_cors_origins = settings.cors_origins_list
+_allow_credentials = _cors_origins != ["*"]
+if _cors_origins == ["*"]:
+    logger.warning(
+        "⚠️ CORS가 전체 오리진('*')을 허용하도록 설정되어 있습니다. "
+        "프로덕션에서는 .env의 CORS_ALLOW_ORIGINS를 특정 도메인으로 제한하세요."
+    )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 프로덕션에서는 특정 도메인으로 제한
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

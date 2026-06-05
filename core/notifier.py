@@ -18,6 +18,7 @@ class TradeNotifier:
         self.bot_token = getattr(self.settings, 'telegram_bot_token', '') or os.getenv('TELEGRAM_BOT_TOKEN', '')
         self.chat_id = getattr(self.settings, 'telegram_chat_id', '') or os.getenv('TELEGRAM_CHAT_ID', '')
         self.is_enabled = bool(self.bot_token and self.chat_id)
+        self._client = httpx.Client(timeout=5.0) if self.is_enabled else None
 
         if not self.is_enabled:
             logger.warning("⚠️ Telegram Notifier가 비활성화 상태입니다. (.env 내 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID를 확인하세요)")
@@ -41,14 +42,13 @@ class TradeNotifier:
         }
         
         try:
-            with httpx.Client() as client:
-                response = client.post(url, json=payload, timeout=5.0)
-                if response.status_code == 200:
-                    logger.info("✅ 텔레그램 알림 전송 완료.")
-                    return True
-                else:
-                    logger.warning(f"⚠️ 텔레그램 API 전송 실패: HTTP {response.status_code} - {response.text}")
-                    return False
+            response = self._client.post(url, json=payload)
+            if response.status_code == 200:
+                logger.info("✅ 텔레그램 알림 전송 완료.")
+                return True
+            else:
+                logger.warning(f"⚠️ 텔레그램 API 전송 실패: HTTP {response.status_code} - {response.text}")
+                return False
         except Exception as e:
             logger.error(f"❌ 텔레그램 통신 중 예외 발생: {e}")
             return False
@@ -150,7 +150,7 @@ class TradeNotifier:
                 f"• <b>심볼(Asset):</b> <code>{symbol}</code>",
                 f"• <b>주문 방향:</b> {side_display}",
                 f"• <b>체결 단가:</b> <code>${price_str}</code>",
-                f"• <b>주문 수량:</b> <code>{amount_str} BTC</code>",
+                f"• <b>주문 수량:</b> <code>{amount_str} {symbol.split('/')[0] if '/' in symbol else symbol}</code>",
                 f"• <b>체결 총액:</b> <code>${total_usdt_str} USDT</code>",
                 f"• <b>가용 잔고:</b> <code>${balance_str} USDT</code>",
                 "────────────────────",

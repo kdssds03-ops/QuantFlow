@@ -810,3 +810,140 @@ class MLPredictor(BasePredictor):
         """하위 호환 인터페이스: 매매 시그널 문자열만 반환합니다."""
         action, _ = self.predict_with_confidence(market_data)
         return action
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 추세추종 예측기 (4h EMA 교차 — 백테스트로 검증된 양방향 엣지)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TrendFollowingPredictor(BasePredictor):
+    """
+    상위 타임프레임(기본 4h) EMA 교차 기반 추세추종 예측기.
+
+    ── 도입 근거 (scripts/signal_research.py · validate_trend.py 검증) ──────────
+    1m 평균회귀(RuleBased/ML)는 180일 실데이터에서 엣지 0(무수수료 PF 1.00)으로
+    수수료에 잠식되어 -16.5% 손실. 반면 4h EMA 교차는 롱·숏 양방향 흑자 +
+    월 5/7 흑자 + 파라미터 전 구간 양수(과최적 아님) + 슬리피지 무관(저빈도)으로
+    슬리피지 포함 +57~60%, Sharpe ~2.4, MDD -17%를 기록.
+
+    신호 규칙 (always-in, stop-and-reverse):
+      최근 완성된 4h봉에서 EMA(fast) > EMA(slow) → "BUY" (상승추세 → 롱)
+                            EMA(fast) < EMA(slow) → "SELL"(하락추세 → 숏)
+    엔진은 이 신호로 자연스럽게 추세전환 시 스톱앤리버스를 수행한다.
+
+    ⚠️ 주의: 이 예측기를 켜면(PREDICTOR_TYPE=TREND) tasks.py가 평균회귀용 가드
+    (4h 타임아웃·+3% 하드TP·-1% 타이트SL)를 자동 비활성화한다. 그 가드들은
+    추세추종의 '승자를 길게 태우는' 엣지를 파괴하기 때문이다.
+    """
+
+    def __init__(
+        self,
+        session_factory=None,
+        ema_fast: int = 30,
+        ema_slow: int = 60,
+        timeframe_minutes: int = 240,  # 4h
+    ):
+        self._session_factory = session_factory
+        self.ema_fast = ema_fast
+        self.ema_slow = ema_slow
+        self.tf_min = timeframe_minutes
+        # 상위 TF봉을 (ema_slow + 버퍼)개 확보하기 위한 1분봉 조회량
+        self._query_limit = int(timeframe_minutes * (ema_slow + 20) * 1.2)
+        self._min_htf_bars = ema_slow + 2
+        self._fallback = RuleBasedPredictor()
+        logger.info(
+            "📈 [TrendFollowingPredictor] 초기화 — EMA(%d/%d) on %dm, 1m조회=%d봉",
+            ema_fast, ema_slow, timeframe_minutes, self._query_limit,
+        )
+
+    @staticmethod
+    def compute_signal(df_1m: pd.DataFrame, ema_fast: int, ema_slow: int,
+                       tf_min: int) -> Tuple[str, float]:
+        """
+        1분봉 DataFrame(컬럼: timestamp_ms, open/high/low/close/volume, 시간오름차순)을
+        상위 TF로 리샘플 후 EMA 교차 신호를 반환. (DB 독립 — 단위검증 가능)
+        """
+        if df_1m is None or len(df_1m) == 0:
+            return "HOLD", 0.0
+        d = df_1m.copy()
+        d["dt"] = pd.to_datetime(d["timestamp_ms"], unit="ms", utc=True)
+        htf = (
+            d.set_index("dt")
+            .resample(f"{tf_min}min")
+            .agg({"open": "first", "high": "max", "low": "min",
+                  "close": "last", "volume": "sum"})
+            .dropna()
+        )
+        if len(htf) < ema_slow + 2:
+            return "HOLD", 0.0
+        ef = htf["close"].ewm(span=ema_fast, adjust=False).mean()
+        es = htf["close"].ewm(span=ema_slow, adjust=False).mean()
+        # 마지막 '완성' 봉 기준 (resample의 마지막 봉은 미완성일 수 있어 직전 봉 사용)
+        f_last, s_last = float(ef.iloc[-2]), float(es.iloc[-2])
+        if np.isnan(f_last) or np.isnan(s_last):
+            return "HOLD", 0.0
+        sep = abs(f_last - s_last) / s_last if s_last else 0.0
+        conf = float(min(0.5 + sep * 20, 0.95))  # 이격이 클수록 확신↑ (정보용)
+        return ("BUY" if f_last > s_last else "SELL"), conf
+
+    def predict_with_confidence(self, market_data: MarketData) -> Tuple[str, float]:
+        if self._session_factory is None:
+            logger.warning("⚠️ [TrendFollowing] session_factory 미주입 → RuleBased 폴백")
+            return self._fallback.predict_with_confidence(market_data)
+        try:
+            if isinstance(market_data, dict):
+                symbol = market_data.get("symbol", "BTC/USDT")
+            else:
+                symbol = getattr(market_data, "symbol", "BTC/USDT")
+
+            from sqlalchemy import desc
+            session = self._session_factory()
+            try:
+                rows = (
+                    session.query(MarketData)
+                    .filter(MarketData.symbol == symbol)
+                    .order_by(desc(MarketData.timestamp))
+                    .limit(self._query_limit)
+                    .all()
+                )
+            finally:
+                session.close()
+
+            if len(rows) < self._min_htf_bars * (self.tf_min // 1):
+                # 상위 TF봉이 부족하면 보수적으로 HOLD (신규 진입/청산 보류)
+                logger.info(
+                    "⏸️ [TrendFollowing] 1분봉 부족(%d봉) → HOLD (워밍업 대기)", len(rows)
+                )
+                return "HOLD", 0.0
+
+            rows.reverse()  # oldest → newest
+            df = pd.DataFrame([
+                {
+                    "timestamp_ms": int(
+                        (r.timestamp.astimezone(timezone.utc)
+                         if r.timestamp.tzinfo else
+                         r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
+                    ),
+                    "open": float(r.open), "high": float(r.high),
+                    "low": float(r.low), "close": float(r.close),
+                    "volume": float(r.volume),
+                }
+                for r in rows
+            ]).sort_values("timestamp_ms").reset_index(drop=True)
+
+            sig, conf = self.compute_signal(df, self.ema_fast, self.ema_slow, self.tf_min)
+            logger.info(
+                "📈 [TrendFollowing] %s 신호=%s (conf=%.2f, EMA%d/%d on %dm)",
+                symbol, sig, conf, self.ema_fast, self.ema_slow, self.tf_min,
+            )
+            return sig, conf
+        except Exception as exc:
+            logger.error(
+                "❌ [TrendFollowing] 추론 예외 → RuleBased 폴백: %s", exc, exc_info=True
+            )
+            return self._fallback.predict_with_confidence(market_data)
+
+    def predict(self, market_data: MarketData) -> str:
+        action, _ = self.predict_with_confidence(market_data)
+        return action

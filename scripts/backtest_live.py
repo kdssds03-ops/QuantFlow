@@ -63,6 +63,8 @@ class StrategyParams:
     # ── 실험용 토글 (개선안) ──
     entry_regime_filter: bool = False  # True: CHOP 국면에서만 신규 진입 허용 (개선#3)
     pyramid_in_chop: bool = False      # 라이브: CHOP에서 피라미딩 0회 (False 유지가 라이브)
+    # ── 추세추종 모드 (PREDICTOR_TYPE=TREND 라이브 재현) ──
+    trend_mode: bool = False           # True: 4h EMA교차 신호 + 평균회귀 가드 비활성화
 
 
 @dataclass
@@ -87,8 +89,28 @@ def classify_regime(adx, atr, atr_avg, p: StrategyParams) -> str:
     return "TREND" if (cond_adx and cond_atr) else "CHOP"
 
 
+def _trend_signal_per_bar(df: pd.DataFrame, ema_fast=30, ema_slow=60, tf_min=240) -> list:
+    """4h EMA 교차 신호를 1분봉마다 매핑 (직전 완성 4h봉 기준). TrendFollowingPredictor와 동치."""
+    d = df.copy()
+    d["dt"] = pd.to_datetime(d["timestamp_ms"], unit="ms", utc=True)
+    htf = (d.set_index("dt").resample(f"{tf_min}min")
+           .agg({"close": "last"}).dropna())
+    ef = htf["close"].ewm(span=ema_fast, adjust=False).mean()
+    es = htf["close"].ewm(span=ema_slow, adjust=False).mean()
+    htf_sig = pd.Series(np.where(ef > es, "BUY", "SELL"), index=htf.index)
+    # 직전 완성봉 신호를 사용: 한 칸 shift 후 1분봉으로 ffill
+    htf_sig = htf_sig.shift(1)
+    mapped = htf_sig.reindex(d["dt"], method="ffill").values
+    return ["HOLD" if (m is None or (isinstance(m, float) and np.isnan(m))) else m for m in mapped]
+
+
 def run_backtest(df: pd.DataFrame, p: StrategyParams, initial: float = 10_000.0):
     pred = RuleBasedPredictor()
+    # 추세모드: 4h 신호 사전계산 + 평균회귀 가드 비활성화 (라이브 _TREND_MODE 재현)
+    trend_sig = _trend_signal_per_bar(df) if p.trend_mode else None
+    if p.trend_mode:
+        p = replace(p, soft_sl=-0.12, hard_sl=-0.15, hard_tp=100.0,
+                    timeout_min=10**9, trail_activate=100.0)
     equity = initial
     pos = Position()
     trades = []
@@ -194,7 +216,10 @@ def run_backtest(df: pd.DataFrame, p: StrategyParams, initial: float = 10_000.0)
                 continue
 
         # ── 예측기 시그널 ───────────────────────────────────────────────
-        sig, _conf = pred.predict_with_confidence(rows[i])
+        if trend_sig is not None:
+            sig = trend_sig[i]
+        else:
+            sig, _conf = pred.predict_with_confidence(rows[i])
 
         if sig == "HOLD":
             equity_curve.append(equity)
@@ -328,7 +353,12 @@ def main():
 
     base = StrategyParams()
     trades, curve, final = run_backtest(df, base)
-    print_report("베이스라인 (라이브 현재 설정)", metrics(trades, curve, 10_000, final), trades)
+    print_report("베이스라인 (라이브 현재 = RULE 평균회귀)", metrics(trades, curve, 10_000, final), trades)
+
+    # PREDICTOR_TYPE=TREND 라이브 토글 재현 (10% 사이징 + 피라미딩 + 가드비활성)
+    tp = StrategyParams(trend_mode=True)
+    tt, tc, tf = run_backtest(df, tp)
+    print_report("신규 TREND 토글 (4h추세 · 실엔진 10%사이징)", metrics(tt, tc, 10_000, tf), tt)
 
     if args.experiments:
         # 개선#3: 진입 국면 필터 (CHOP에서만 평균회귀 진입)

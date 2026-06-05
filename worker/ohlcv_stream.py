@@ -156,8 +156,12 @@ class OhlcvStreamManager:
             snapshot,
             columns=["timestamp_ms", "open", "high", "low", "close", "volume"],
         )
-        # 타임스탬프 오름차순 정렬 보장 (중복/역전 방어)
-        df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
+        # 타임스탬프 오름차순 정렬 + 중복 제거.
+        # WebSocket 확정 캔들과 REST seed_from_rest()가 동일 ts를 각각 append할 수 있어
+        # 같은 캔들이 2행으로 들어가면 compute_all_features()의 지표가 왜곡된다.
+        # 같은 ts는 가장 마지막(최신) 값만 남겨 1행으로 정규화한다.
+        df = df.sort_values("timestamp_ms", ascending=True)
+        df = df.drop_duplicates(subset="timestamp_ms", keep="last").reset_index(drop=True)
         return df
 
     def is_alive(self, symbol: str, max_stale_sec: float = 90.0) -> bool:

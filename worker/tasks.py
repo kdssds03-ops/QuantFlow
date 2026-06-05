@@ -1609,8 +1609,25 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
 
     try:
         now_utc = datetime.now(timezone.utc)
+
+        # ── [원격 제어] /pause 일시정지 가드 ──────────────────────────────────
+        # handle_telegram_command()이 quantflow:sys_status="PAUSED"를 기록하면
+        # 신규 분석/진입/청산을 전면 동결한다. (이전엔 키를 기록만 하고 읽지 않아
+        # /pause가 무력화되어 있었음 — 실거래 안전장치 복원)
+        # Redis 조회 실패 시에는 가용성 우선으로 매매를 계속한다(기존 동작 유지).
+        try:
+            _status_r = _r_sync if _r_sync is not None else _sync_redis_lib.Redis.from_url(
+                settings.redis_url, decode_responses=True, socket_connect_timeout=2
+            )
+            _sys_status = _status_r.get("quantflow:sys_status")
+            if _sys_status is not None and str(_sys_status).upper() == "PAUSED":
+                logger.warning("⏸️ [원격 제어] 시스템 PAUSED 상태 — analyze_and_trade 동결 (이번 트리거 스킵)")
+                return {"status": "system_paused", "symbol": symbol}
+        except Exception as _status_exc:
+            logger.warning("⚠️ [원격 제어] sys_status 조회 실패 (매매 계속 진행): %s", _status_exc)
+
         exchange = get_exchange()
-        
+
         # [이슈 2 해결] 시간 균열(NTP Drift)로 인한 타임스탬프 거절 방어 이중 Failsafe
         exchange.options['adjustForTimeDifference'] = True
         exchange.options['recvWindow'] = 10000
@@ -2386,13 +2403,24 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
             PRICE_BUFFER_PCT = _effective_buffer_pct
 
             
+            # ── [가드 범위 한정] 역시그널 청산(스위칭)은 단가 가드 면제 ──────────────
+            # 이 단가 버퍼 가드는 '같은 방향 추가 진입(피라미딩)'에서 평단가를 방어하기
+            # 위한 것이다. 그러나 아래 두 경우는 기존 포지션을 닫는 '청산' 주문이므로
+            # 유리한 단가 조건으로 막아서는 안 된다 (리스크 관리용 청산이 차단되는 버그):
+            #   • action=SELL & position=LONG  → 롱 청산
+            #   • action=BUY  & position=SHORT → 숏 청산
+            _is_reverse_exit = (
+                (action == "SELL" and current_position == "LONG")
+                or (action == "BUY" and current_position == "SHORT")
+            )
+
             # 최근 5분 이내 동일 방향 거래 이력 조회
             cooldown_cutoff = now_utc - timedelta(minutes=COOLDOWN_MINUTES)
             recent_same_side = session.query(TradeHistory).filter(
                 TradeHistory.symbol == symbol, TradeHistory.side == action, TradeHistory.timestamp >= cooldown_cutoff
             ).order_by(desc(TradeHistory.timestamp)).first()
 
-            if recent_same_side is not None:
+            if recent_same_side is not None and not _is_reverse_exit:
                 last_price = Decimal(str(recent_same_side.price))
                 
                 if action == "SELL":
@@ -2765,10 +2793,11 @@ def _send_status_brief():
     (비동기 DB 조회 원천 제거, 100% 동기식 API 기반 단일화 완료)
     """
     try:
+        # get_exchange()가 settings.exchange_sandbox 기준으로 데모/실전을 이미 결정하므로
+        # 별도의 set_sandbox_mode 토글은 불필요하다. (과거 존재하지 않는 속성
+        # settings.BINANCE_SANDBOX_MODE를 참조하던 죽은 코드를 제거)
         exchange = get_exchange()
-        if getattr(settings, "BINANCE_SANDBOX_MODE", False):
-            exchange.set_sandbox_mode(True)
-            
+
         total_assets, usdt_free = _get_futures_margin_balance(exchange)
         
         symbol = "BTC/USDT"

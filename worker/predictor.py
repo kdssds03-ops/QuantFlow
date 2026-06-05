@@ -126,24 +126,11 @@ class RuleBasedPredictor(BasePredictor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # RuleBasedPredictor는 순수 볼린저밴드+RSI 규칙만 사용한다.
+        # (과거 이 생성자가 XGBoost 모델을 self.model로 로드했으나 predict 로직에서
+        #  전혀 참조하지 않는 죽은 코드였다 → 매 부팅 시 불필요한 파일 I/O·메모리 제거.
+        #  ML 추론이 필요하면 PREDICTOR_TYPE=ML 로 MLPredictor를 사용할 것.)
         self.model = None
-        if xgb is not None:
-            try:
-                # 최상단 프로젝트 루트를 기준으로 경로 탐색
-                project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                model_path = os.path.join(project_root, "data", "xgb_btc_v2.json")
-                
-                if os.path.exists(model_path):
-                    self.model = xgb.XGBClassifier()
-                    self.model.load_model(model_path)
-                    logger.info(f"✅ [QuantFlow] XGBoost 실전 가중치 로드 성공: {model_path}")
-                else:
-                    logger.warning(f"⚠️ [QuantFlow] 모델 가중치 파일 없음 ({model_path}) -> Rule-Based 폴백 대기")
-            except Exception as e:
-                logger.error(f"❌ [QuantFlow] XGBoost 모델 로드 중 치명적 예외 발생: {e} -> Rule-Based 폴백 대기")
-                self.model = None
-        else:
-            logger.warning("⚠️ xgboost 모듈 미설치. ML 추론 불가 -> Rule-Based 모드로 구동됩니다.")
 
     def predict(self, market_data: MarketData) -> str:
         """

@@ -103,6 +103,9 @@ services:
     env_file: .env
     environment:
       - NUMBA_DISABLE_JIT=1
+      # .pyc 캐시 비활성: __pycache__ 익명 볼륨에 옛 바이트코드가 남아 코드 변경이
+      # 반영되지 않던 문제 방지(Windows 바인드마운트 mtime 이슈) → 항상 소스에서 로드
+      - PYTHONDONTWRITEBYTECODE=1
     entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
     command: >
       celery -A worker.celery_app worker
@@ -136,6 +139,9 @@ services:
     env_file: .env
     environment:
       - NUMBA_DISABLE_JIT=1
+      # .pyc 캐시 비활성: __pycache__ 익명 볼륨에 옛 바이트코드가 남아 코드 변경이
+      # 반영되지 않던 문제 방지(Windows 바인드마운트 mtime 이슈) → 항상 소스에서 로드
+      - PYTHONDONTWRITEBYTECODE=1
     entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
     command: >
       celery -A worker.celery_app worker
@@ -161,6 +167,9 @@ services:
     container_name: qf-beat
     restart: unless-stopped
     env_file: .env
+    environment:
+      # .pyc 캐시 비활성 (코드 변경 미반영 방지) — worker와 동일
+      - PYTHONDONTWRITEBYTECODE=1
     entrypoint: ["/bin/bash", "/opt/quantflow/scripts/worker-entrypoint.sh"]
     command: >
       celery -A worker.celery_app beat

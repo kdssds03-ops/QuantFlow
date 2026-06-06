@@ -2801,7 +2801,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 else:
                     trigger_type = "ALREADY_IN_SHORT_HOLD"
                     calculated_amount = Decimal("0")
-                    logger.info("⏸️  [자산 배분 - 숏 진입] 이미 숏 포지션 보유 중이므로 신규 진입을 무시합니다.")
+                    logger.debug("⏸️  [자산 배분 - 숏 진입] 이미 숏 포지션 보유 중 — 포지션 유지.")
 
             elif action == "BUY":
                 if current_position == "SHORT":
@@ -2845,9 +2845,16 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 else:
                     trigger_type = "ALREADY_IN_LONG_HOLD"
                     calculated_amount = Decimal("0")
-                    logger.info("⏸️  [자산 배분 - 롱 진입] 이미 롱 포지션 보유 중이므로 신규 진입을 무시합니다.")
+                    logger.debug("⏸️  [자산 배분 - 롱 진입] 이미 롱 포지션 보유 중 — 포지션 유지.")
+
+            # 의도적 홀드(동일 방향 보유 중 / 신규 진입 없음)는 주문 없이 조용히 종료.
+            # → "insufficient_calculated_amount" 오인 경고(매분 노이즈)를 방지하고 'hold'로 명확히 반환.
+            if trigger_type in ("HOLD", "ALREADY_IN_SHORT_HOLD", "ALREADY_IN_LONG_HOLD"):
+                logger.debug("⏸️ [%s] 신규 주문 없음 — 포지션 유지", trigger_type)
+                return {"status": "hold", "trigger_type": trigger_type, "position": current_position}
 
             # 방어적 검증 (Short-circuit): 수량 부족 시 주문 취소 및 조기 리턴 (최소 0.001 BTC)
+            # (위 홀드 분기를 통과한 실제 진입/청산만 도달 — 양자화로 0이 된 극단 케이스 방어)
             if calculated_amount <= Decimal("0") or calculated_amount < Decimal("0.001"):
                 logger.warning(
                     f"⏸️  [{trigger_type}] 계산된 주문 수량이 부족하여 주문 생략: "

@@ -1297,34 +1297,6 @@ async def _async_query_today_trades(symbol: str, start_of_day_naive: datetime) -
         return result.scalars().all()
 
 
-async def _async_query_all_filled_sells(symbol: str) -> list:
-    """
-    비동기 세션(core.database.async_session)을 사용하여 해당 심볼의
-    전체 FILLED SELL(숏 진입) 이력을 타임스탬프 오름차순으로 조회합니다.
-
-    generate_daily_report_task()의 Short PnL 계산 로직에서
-    asyncio.run()으로 감싸 호출합니다.
-
-    Args:
-        symbol: 조회할 심볼 (예: "BTC/USDT")
-
-    Returns:
-        TradeHistory 객체 리스트 (side == 'SELL', status == 'FILLED', timestamp 오름차순)
-    """
-    async with _async_session_factory() as session:
-        stmt = (
-            sa_select(TradeHistory)
-            .where(
-                TradeHistory.symbol == symbol,
-                TradeHistory.side   == "SELL",
-                TradeHistory.status == "FILLED",
-            )
-            .order_by(TradeHistory.timestamp.asc())
-        )
-        result = await session.execute(stmt)
-        return result.scalars().all()
-
-
 async def _async_save_trade_history(
     timestamp: datetime,
     symbol: str,
@@ -3393,12 +3365,10 @@ def generate_daily_report_task():
         # for session in _get_sync_session() 외부에서 _run_async_safe()로 미리 조회.
         # 세션 내부에서 asyncio.run() 호출 시 커넥션 경합 Deadlock 유발 원천 차단.
         async def _combined_report_query():
-            return await asyncio.gather(
-                _async_query_today_trades(symbol, start_of_day_naive),
-                _async_query_all_filled_sells(symbol)
-            )
+            # 실현손익은 거래소 Income API(권위 데이터)로 계산하므로 과거 SELL 전수 조회 불필요.
+            return await _async_query_today_trades(symbol, start_of_day_naive)
 
-        today_trades, all_filled_sells_for_pnl = _run_async_safe(_combined_report_query())
+        today_trades = _run_async_safe(_combined_report_query())
 
         for session in _get_sync_session():
             latest = session.query(MarketData).filter(
@@ -3526,64 +3496,56 @@ def generate_daily_report_task():
                 symbol, symbol_normalized, start_of_day_naive.isoformat(), len(today_trades),
             )
 
-            # ── [STEP 3] 숏 전략 기반 PnL 계산 ────────────────────────────────
-            # (all_filled_sells_for_pnl — for session 블록 외부에서 _run_async_safe()로 사전 조회 완료)
-            # Short PnL = (숏 진입가 - 청산가) × 수량  =  (avg_sell_price - buy_price) × buy_qty
+            # ── [STEP 3] 실현 손익/승률 계산 — 거래소 Income API (권위 데이터) ──────
+            # 과거 FIFO(숏 전용 가정) 방식은 양방향(롱/숏) 전략에서 오계산 + 날짜 경계 누락으로
+            # 거짓 손익을 냈다. REALIZED_PNL income 레코드는 방향 무관·거래소 확정값이므로 정확.
+            # 당일(KST 00:00) 이후 스코프로 조회. (/status 핸들러와 동일 패턴 — 3108~3157행)
+            kst_midnight = datetime(now_kst.year, now_kst.month, now_kst.day, 0, 0, 0, tzinfo=kst_tz)
+            _income_start_ms = int(kst_midnight.timestamp() * 1000)
 
-            today_filled_buys_for_pnl = [
-                t for t in today_trades
-                if t.side == "BUY" and t.status == "FILLED" and t.price is not None
-            ]
-
-            # 숏 진입(SELL)들을 시간 오름차순으로 정렬하여 FIFO 매칭 큐 구성
-            sorted_sells = sorted(all_filled_sells_for_pnl, key=lambda x: x.timestamp)
-            sell_queue = []
-            for s in sorted_sells:
-                if s.price is not None and s.amount is not None:
-                    sell_queue.append({
-                        "price": Decimal(str(s.price)),
-                        "amount": Decimal(str(s.amount)),
-                        "remaining": Decimal(str(s.amount)),
-                        "timestamp": s.timestamp
-                    })
-
-            # 오늘 청산(BUY)들을 시간 오름차순으로 정렬
-            sorted_buys = sorted(today_filled_buys_for_pnl, key=lambda x: x.timestamp)
-
-            realized_pnl = Decimal("0")
+            realized_pnl     = None        # None = 조회 실패(정직 표기). 절대 옛 FIFO 폴백 금지.
+            income_commission = Decimal("0")
+            income_funding    = Decimal("0")
             win_count    = 0
             loss_count   = 0
 
-            for buy_trade in sorted_buys:
-                buy_price = Decimal(str(buy_trade.price))
-                buy_qty   = Decimal(str(buy_trade.amount))
-                
-                trade_pnl = Decimal("0")
-                matched_total_qty = Decimal("0")
-                
-                # FIFO 방식으로 이 BUY 이전의 SELL들과 매칭
-                for sell in sell_queue:
-                    if buy_qty <= Decimal("0"):
-                        break
-                    if sell["timestamp"] > buy_trade.timestamp:
-                        # BUY 시점 이후의 진입은 매칭 불가
-                        continue
-                    if sell["remaining"] <= Decimal("0"):
-                        continue
-                        
-                    match_qty = min(buy_qty, sell["remaining"])
-                    trade_pnl += (sell["price"] - buy_price) * match_qty
-                    matched_total_qty += match_qty
-                    
-                    sell["remaining"] -= match_qty
-                    buy_qty -= match_qty
-                
-                if matched_total_qty > Decimal("0"):
-                    realized_pnl += trade_pnl
-                    if trade_pnl > Decimal("0"):
-                        win_count += 1
-                    else:
-                        loss_count += 1
+            try:
+                _income_raw = exchange.fapiPrivateGetIncome(params={
+                    "startTime": _income_start_ms,
+                    "limit":     1000,
+                })
+                if isinstance(_income_raw, list):
+                    _rp = Decimal("0")
+                    for _inc in _income_raw:
+                        try:
+                            if int(_inc.get("time", 0) or 0) < _income_start_ms:
+                                continue
+                            _itype = str(_inc.get("incomeType", "") or "").upper()
+                            _iincome = _inc.get("income", None)
+                            if _iincome is None:
+                                continue
+                            _iamt = Decimal(str(_iincome))
+                            if _itype == "REALIZED_PNL":
+                                _rp += _iamt
+                                if _iamt > Decimal("0"):
+                                    win_count += 1
+                                elif _iamt < Decimal("0"):
+                                    loss_count += 1
+                            elif _itype == "COMMISSION":
+                                income_commission += _iamt
+                            elif _itype == "FUNDING_FEE":
+                                income_funding += _iamt
+                        except Exception:
+                            continue
+                    realized_pnl = _rp
+                    logger.info(
+                        "📊 [일일결산] Income API 실현손익=%s (익절 %d/손절 %d), 수수료=%s, 펀딩=%s",
+                        realized_pnl, win_count, loss_count, income_commission, income_funding,
+                    )
+                else:
+                    logger.warning("⚠️ [일일결산] Income API 응답이 list 아님: %s", type(_income_raw))
+            except Exception as _inc_exc:
+                logger.warning("⚠️ [일일결산] Income API 조회 실패 — 손익 '조회 실패' 표기: %s", _inc_exc)
 
             # ── [STEP 4] 매매 요약 집계 ─────────────────────────────────────────
             total_count    = len(today_trades)
@@ -3596,15 +3558,21 @@ def generate_daily_report_task():
             evaluated_total = win_count + loss_count
             win_rate_str    = f"{(win_count / evaluated_total * 100):.1f}%" if evaluated_total > 0 else "N/A"
 
-            if realized_pnl > Decimal("0"):
-                pnl_emoji = "📈"
-                pnl_sign  = "+"
-            elif realized_pnl < Decimal("0"):
-                pnl_emoji = "📉"
-                pnl_sign  = ""
+            # 실현손익 표시 문자열 (None = Income API 조회 실패 → 정직하게 '조회 실패')
+            if realized_pnl is None:
+                pnl_emoji      = "⚠️"
+                realized_pnl_str = "조회 실패 (Income API)"
+                net_pnl_str      = None
             else:
-                pnl_emoji = "➖"
-                pnl_sign  = ""
+                if realized_pnl > Decimal("0"):
+                    pnl_emoji = "📈"
+                elif realized_pnl < Decimal("0"):
+                    pnl_emoji = "📉"
+                else:
+                    pnl_emoji = "➖"
+                realized_pnl_str = f"{realized_pnl:+,.2f} USDT"
+                _net_pnl = realized_pnl + income_commission + income_funding
+                net_pnl_str = f"{_net_pnl:+,.2f} USDT"
 
 
             report_time_kst = now_kst.strftime("%Y-%m-%d %H:%M:%S KST")
@@ -3669,9 +3637,10 @@ def generate_daily_report_task():
                 f"• <b>실패(FAILED):</b> <code>{failed_count}건</code>",
                 f"• <b>체결 성공률:</b> <code>{fill_rate_str}</code>",
                 "",
-                "🎯 <b>실현 손익 및 승률</b>  ※ Short 전략 기준",
+                "🎯 <b>실현 손익 및 승률</b>",
                 "────────────────────",
-                f"• {pnl_emoji} <b>금일 실현 손익:</b> <code>{pnl_sign}{realized_pnl:,.2f} USDT</code>",
+                f"• {pnl_emoji} <b>금일 실현 손익:</b> <code>{realized_pnl_str}</code>",
+                (f"  └ 순손익(수수료·펀딩 포함): <code>{net_pnl_str}</code>" if net_pnl_str else "  └ 순손익: <code>-</code>"),
                 f"• <b>익절(Win):</b> <code>{win_count}건</code> / <b>손절(Loss):</b> <code>{loss_count}건</code>",
                 f"• <b>승률:</b> <code>{win_rate_str}</code>",
                 "━━━━━━━━━━━━━━━━━━━━",
@@ -3680,8 +3649,8 @@ def generate_daily_report_task():
             
             notifier.send_message("\n".join(report_lines))
             logger.info(
-                "📊 [generate_daily_report_task] 리포트 전송 완료 — 포지션=%s, PnL: %s%s USDT, 미실현: %s",
-                current_position, pnl_sign, f"{realized_pnl:,.2f}", unrealized_pnl_str or "N/A",
+                "📊 [generate_daily_report_task] 리포트 전송 완료 — 포지션=%s, 실현손익=%s, 익절/손절=%d/%d, 미실현=%s",
+                current_position, realized_pnl_str, win_count, loss_count, unrealized_pnl_str or "N/A",
             )
 
             return {
@@ -3689,8 +3658,10 @@ def generate_daily_report_task():
                 "position":       current_position,
                 "total_trades":   total_count,
                 "filled_trades":  filled_count,
-                "realized_pnl":   str(realized_pnl),
+                "realized_pnl":   (str(realized_pnl) if realized_pnl is not None else None),
                 "unrealized_pnl": str(unrealized_pnl),
+                "win_count":      win_count,
+                "loss_count":     loss_count,
                 "win_rate":       win_rate_str,
             }
 

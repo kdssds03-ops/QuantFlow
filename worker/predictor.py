@@ -910,11 +910,8 @@ class TrendFollowingPredictor(BasePredictor):
             finally:
                 session.close()
 
-            if len(rows) < self._min_htf_bars * (self.tf_min // 1):
-                # 상위 TF봉이 부족하면 보수적으로 HOLD (신규 진입/청산 보류)
-                logger.info(
-                    "⏸️ [TrendFollowing] 1분봉 부족(%d봉) → HOLD (워밍업 대기)", len(rows)
-                )
+            if not rows:
+                logger.info("⏸️ [TrendFollowing] 캔들 없음 → HOLD (워밍업 대기)")
                 return "HOLD", 0.0
 
             rows.reverse()  # oldest → newest

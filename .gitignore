@@ -35,3 +35,6 @@ Thumbs.db
 
 # 대용량 시세 데이터 (재수집 가능 — scripts/fetch_ohlcv.py)
 data/btc_1m_1year.csv
+
+# 백테스트 캐시 (재생성 가능)
+data/_basket_4h.json

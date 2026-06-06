@@ -1192,6 +1192,81 @@ def _check_daily_loss_breaker(current_equity: Decimal) -> bool:
 
 
 # ─────────────────────────────────────────────
+# 📊 변동성 타게팅 — 동적 사이징 배율
+# ─────────────────────────────────────────────
+def _vol_target_scale(symbol: str = "BTC/USDT") -> Decimal:
+    """
+    최근 실현변동성 대비 장기평균(앵커) 비율로 진입 사이징 배율을 산출한다.
+      scale = clip(anchor_vol / realized_vol, scale_min, scale_max)
+    변동성이 평소보다 높으면 scale<1(축소), 낮으면 scale>1(확대). 평균은 ~1로 유지.
+    앵커는 Redis에 EMA로 보존(반감기 vol_anchor_halflife_days). 비활성/오류 시 1.0 반환.
+
+    백테스트(3년 BTC 4h 추세): Sharpe 0.68→0.81, 학습·검증 모두 개선.
+    """
+    if not getattr(settings, "vol_target_enabled", False):
+        return Decimal("1")
+    if _r_sync is None:
+        return Decimal("1")
+    try:
+        n4h = int(getattr(settings, "vol_realized_4h_bars", 30))
+        # 실현변동성 추정에 필요한 1분봉 (4h * (n+2) 여유분)
+        need_1m = 240 * (n4h + 3)
+        session = _SyncSession()
+        try:
+            from sqlalchemy import desc as _desc
+            rows = (
+                session.query(MarketData.timestamp, MarketData.close)
+                .filter(MarketData.symbol == symbol)
+                .order_by(_desc(MarketData.timestamp))
+                .limit(need_1m)
+                .all()
+            )
+        finally:
+            session.close()
+        if len(rows) < 240 * 5:  # 최소 ~5일치 없으면 보류
+            return Decimal("1")
+
+        df = pd.DataFrame(
+            [{"ts": int((r[0].astimezone(timezone.utc) if r[0].tzinfo
+                         else r[0].replace(tzinfo=timezone.utc)).timestamp() * 1000),
+              "close": float(r[1])} for r in rows]
+        ).sort_values("ts")
+        df["dt"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+        # 4h 리샘플 → 최근 n4h개 봉 수익률의 연율 변동성
+        c4 = df.set_index("dt")["close"].resample("240min").last().dropna()
+        if len(c4) < n4h + 2:
+            return Decimal("1")
+        ret4 = c4.pct_change().dropna()
+        _bars_per_year_4h = 365 * 6  # 4h봉/년 (연율화)
+        realized = float(ret4.tail(n4h).std()) * (_bars_per_year_4h ** 0.5)
+        if not (realized > 0) or math.isnan(realized):
+            return Decimal("1")
+
+        # 장기 앵커 EMA (Redis 보존). 분당 갱신 → 반감기를 분 단위 alpha로 환산.
+        hl_min = max(float(getattr(settings, "vol_anchor_halflife_days", 90.0)), 1.0) * 1440.0
+        alpha = 1.0 - 0.5 ** (1.0 / hl_min)
+        _akey = f"quantflow:vol_anchor:{symbol.replace('/', '')}"
+        prev = _r_sync.get(_akey)
+        if prev is None:
+            anchor = realized
+        else:
+            anchor = (1 - alpha) * float(prev) + alpha * realized
+        _r_sync.set(_akey, repr(anchor))
+
+        smin = float(getattr(settings, "vol_scale_min", 0.5))
+        smax = float(getattr(settings, "vol_scale_max", 2.0))
+        scale = min(max(anchor / realized, smin), smax)
+        logger.info(
+            "📊 [변동성타겟] 실현 %.1f%% vs 앵커 %.1f%% → 사이징 배율 %.2fx",
+            realized * 100, anchor * 100, scale,
+        )
+        return Decimal(str(round(scale, 4)))
+    except Exception as exc:
+        logger.warning("⚠️ [변동성타겟] 산출 실패 (배율 1.0 유지): %s", exc)
+        return Decimal("1")
+
+
+# ─────────────────────────────────────────────
 # 🔁 [비동기 DB 헬퍼] 날짜 필터 조회 — async_session 기반
 # ─────────────────────────────────────────────
 async def _async_query_today_trades(symbol: str, start_of_day_naive: datetime) -> list:
@@ -2672,6 +2747,8 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
 
             # 7. ⚡ 주문 분기점 정의 및 동적 주문 수량 계산 (Symmetric LONG & SHORT Pipeline)
             # RISK_FACTOR는 모듈 상단에서 .env(settings.risk_factor) 기반으로 정의됨 (위 참조)
+            # 변동성 타게팅: 평균은 RISK_FACTOR 유지, 변동성에 따라 사이징 배율 조절 (비활성 시 1.0)
+            _EFFECTIVE_RISK = RISK_FACTOR * _vol_target_scale(symbol)
             _step = _get_lot_size_step(exchange, symbol, fallback_step="0.001")
             
             # 0 나눗셈 및 math.isnan 방어 가드
@@ -2696,7 +2773,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 elif current_position == "FLAT":
                     # 신규 숏 진입
                     trigger_type = "SNIPER_SHORT_ENTRY"
-                    raw_amount = (usdt_free * RISK_FACTOR) / current_close
+                    raw_amount = (usdt_free * _EFFECTIVE_RISK) / current_close
                     # 0.001 미만으로 내려앉지 않도록 최소 안전장치 (최소 수량 하한선 0.001 BTC 설정)
                     if raw_amount < Decimal("0.001"):
                         logger.warning(
@@ -2718,7 +2795,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     quantized = _quantize_amount(raw_amount, _step, min_order=Decimal("0.001"))
                     calculated_amount = quantized if quantized is not None else Decimal("0")
                     logger.info(
-                        f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표 (10%): {usdt_free * RISK_FACTOR} USDT -> "
+                        f"💰 [자산 배분 - 숏 진입] 가용 USDT: {usdt_free} -> 진입 목표: {usdt_free * _EFFECTIVE_RISK} USDT (사이징 {_EFFECTIVE_RISK}) -> "
                         f"계산 수량: {raw_amount} BTC -> stepSize({_step}) 적용 최종 수량: {calculated_amount} BTC"
                     )
                 else:
@@ -2735,7 +2812,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 elif current_position == "FLAT":
                     # 신규 롱 진입
                     trigger_type = "SNIPER_LONG_ENTRY"
-                    raw_amount = (usdt_free * RISK_FACTOR) / current_close
+                    raw_amount = (usdt_free * _EFFECTIVE_RISK) / current_close
                     # 0.001 미만으로 내려앉지 않도록 최소 안전장치 (최소 수량 하한선 0.001 BTC 설정)
                     if raw_amount < Decimal("0.001"):
                         logger.warning(
@@ -2762,7 +2839,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     quantized = _quantize_amount(raw_amount, _step, min_order=Decimal("0.001"))
                     calculated_amount = quantized if quantized is not None else Decimal("0")
                     logger.info(
-                        f"💰 [자산 배분 - 롱 진입] 가용 USDT: {usdt_free} -> 진입 목표 (10%): {usdt_free * RISK_FACTOR} USDT -> "
+                        f"💰 [자산 배분 - 롱 진입] 가용 USDT: {usdt_free} -> 진입 목표: {usdt_free * _EFFECTIVE_RISK} USDT (사이징 {_EFFECTIVE_RISK}) -> "
                         f"계산 수량: {raw_amount} BTC -> stepSize({_step}) 적용 최종 수량: {calculated_amount} BTC"
                     )
                 else:

@@ -99,4 +99,12 @@ celery_app.conf.beat_schedule = {
         # ⇒ /status 명령은 매매 진행여부 무관하게 항상 즉시 응답 보장
         "options": {"queue": "listener"},
     },
+
+    # ── 12시간마다 시스템 자가 헬스체크 → 텔레그램 발송 (00:05, 12:05 KST) ──
+    #    Claude 앱·노트북 무관하게 서버 내부에서 24h 자가감시 (데드맨 스위치 역할)
+    "system-healthcheck-12h": {
+        "task": "worker.tasks.system_health_check_task",
+        "schedule": crontab(hour="*/12", minute=5),
+        "options": {"queue": "default"},
+    },
 }

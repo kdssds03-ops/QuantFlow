@@ -3668,3 +3668,122 @@ def generate_daily_report_task():
     except Exception as exc:
         logger.error(f"❌ [generate_daily_report_task] 리포트 생성 중 예외 발생: {exc}", exc_info=True)
         return {"status": "report_failed", "error": str(exc)}
+
+
+@celery_app.task(name="worker.tasks.system_health_check_task", queue="default")
+def system_health_check_task():
+    """
+    봇 자체 시스템 헬스체크 (Claude 앱·노트북 무관, 서버 내장 24h 자가감시).
+
+    beat가 주기적으로(기본 12h) 호출 → 거래소 연결/잔고, 포지션·미실현, DB 신선도,
+    리스크가드(sys_status), 오늘 실현손익을 점검하고 결과를 텔레그램으로 발송한다.
+    이 태스크가 성공적으로 도는 것 자체가 worker/beat/redis/db/네트워크 생존의 증거이며,
+    정기 리포트가 안 오면(사용자 관점) 봇 정지의 신호가 된다(데드맨 스위치 역할).
+    """
+    logger.info("🩺 [헬스체크] system_health_check_task 가동")
+    checks = []  # (label, emoji, detail)
+
+    def add(label, ok, detail, warn=False):
+        checks.append((label, ("✅" if ok else ("⚠️" if warn else "❌")), detail))
+
+    try:
+        kst = timezone(timedelta(hours=9))
+        now_kst = datetime.now(kst)
+
+        # 1) 거래소 연결 + 마진 잔고
+        exchange = get_exchange()
+        ex_ok = False
+        try:
+            total_margin, _free = _get_futures_margin_balance(exchange)
+            add("거래소 연결/잔고", True, f"마진 {float(total_margin):,.2f} USDT")
+            ex_ok = True
+        except Exception as e:
+            add("거래소 연결/잔고", False, f"조회 실패: {str(e)[:60]}")
+
+        # 2) 포지션 + 미실현 ROI (재난스톱 -15% 근접 시 경고)
+        if ex_ok:
+            try:
+                pos_line = "FLAT (무포지션)"
+                pos_warn = False
+                for p in exchange.fetch_positions(["BTC/USDT"]):
+                    amt = float(p["info"].get("positionAmt", 0) or 0)
+                    if amt != 0:
+                        upnl = float(p["info"].get("unRealizedProfit", 0) or 0)
+                        entry = float(p["info"].get("entryPrice", 0) or 0)
+                        notional = abs(amt) * entry
+                        roi = (upnl / notional * 100) if notional > 0 else 0.0
+                        side = "LONG" if amt > 0 else "SHORT"
+                        pos_line = f"{side} {abs(amt)} @ ${entry:,.0f}, 미실현 {upnl:+.2f} USDT ({roi:+.1f}%)"
+                        pos_warn = roi <= -10.0
+                        break
+                add("포지션/미실현", True, pos_line, warn=pos_warn)
+            except Exception as e:
+                add("포지션/미실현", False, f"조회 실패: {str(e)[:50]}")
+
+        # 3) DB 데이터 신선도 (fetch 파이프라인 생존 — 5분 이내 정상)
+        try:
+            latest = None
+            for session in _get_sync_session():
+                latest = session.query(MarketData).filter(
+                    MarketData.symbol == "BTC/USDT"
+                ).order_by(desc(MarketData.timestamp)).first()
+            if latest is not None:
+                ts = latest.timestamp
+                ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts.astimezone(timezone.utc)
+                age = (datetime.now(timezone.utc) - ts).total_seconds() / 60.0
+                add("DB 데이터 신선도", age < 10, f"최신 캔들 {age:.0f}분 전", warn=(5 <= age < 10))
+            else:
+                add("DB 데이터 신선도", False, "BTC/USDT 캔들 없음")
+        except Exception as e:
+            add("DB 데이터 신선도", False, f"조회 실패: {str(e)[:50]}")
+
+        # 4) 리스크가드 (sys_status) — PAUSED면 매매 중단 상태
+        try:
+            ss = _r_sync.get("quantflow:sys_status") if _r_sync is not None else None
+            paused = (str(ss).upper() == "PAUSED") if ss else False
+            add("리스크가드(sys_status)", not paused,
+                ("⏸️ PAUSED — 매매 중단됨(/resume 필요)" if paused else "RUNNING"), warn=paused)
+        except Exception as e:
+            add("리스크가드(sys_status)", False, f"조회 실패: {str(e)[:40]}")
+
+        # 5) 오늘(KST) 실현손익 — Income API (권위 데이터)
+        if ex_ok:
+            try:
+                s_ms = int(datetime(now_kst.year, now_kst.month, now_kst.day, tzinfo=kst).timestamp() * 1000)
+                inc = exchange.fapiPrivateGetIncome(params={"startTime": s_ms, "limit": 1000})
+                _R = [Decimal(str(i["income"])) for i in inc
+                      if str(i.get("incomeType", "")).upper() == "REALIZED_PNL" and i.get("income") is not None]
+                _rp = sum(_R, Decimal("0"))
+                _w = sum(1 for x in _R if x > 0)
+                _l = sum(1 for x in _R if x < 0)
+                add("오늘 실현손익", True, f"{_rp:+,.2f} USDT (익절 {_w}/손절 {_l})")
+            except Exception as e:
+                add("오늘 실현손익", False, f"조회 실패: {str(e)[:40]}", warn=True)
+
+        # ── 종합 판정 + 텔레그램 발송 ──
+        n_fail = sum(1 for _, e, _ in checks if e == "❌")
+        n_warn = sum(1 for _, e, _ in checks if e == "⚠️")
+        verdict = "🔴 이상" if n_fail else ("🟡 주의" if n_warn else "🟢 정상")
+
+        lines = [
+            "🩺 <b>[QuantFlow 시스템 헬스체크]</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+            f"• <b>종합 판정:</b> <b>{verdict}</b>  (❌{n_fail} / ⚠️{n_warn})",
+            f"• <b>시각:</b> <code>{now_kst.strftime('%Y-%m-%d %H:%M KST')}</code>",
+            "────────────────────",
+        ]
+        for label, emoji, detail in checks:
+            lines.append(f"{emoji} <b>{label}</b>: {detail}")
+        lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+        notifier.send_message("\n".join(lines))
+        logger.info("🩺 [헬스체크] 발송 완료 — 판정=%s (fail=%d, warn=%d)", verdict, n_fail, n_warn)
+        return {"status": "healthcheck_sent", "verdict": verdict, "fail": n_fail, "warn": n_warn}
+
+    except Exception as exc:
+        logger.error("❌ [system_health_check_task] 헬스체크 실패: %s", exc, exc_info=True)
+        try:
+            notifier.send_message(f"🩺⚠️ <b>[헬스체크]</b> 실행 중 예외: <code>{str(exc)[:200]}</code>")
+        except Exception:
+            pass
+        return {"status": "healthcheck_failed", "error": str(exc)}

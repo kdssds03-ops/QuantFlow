@@ -3776,9 +3776,20 @@ def system_health_check_task():
             lines.append(f"{emoji} <b>{label}</b>: {detail}")
         lines.append("━━━━━━━━━━━━━━━━━━━━")
 
-        notifier.send_message("\n".join(lines))
-        logger.info("🩺 [헬스체크] 발송 완료 — 판정=%s (fail=%d, warn=%d)", verdict, n_fail, n_warn)
-        return {"status": "healthcheck_sent", "verdict": verdict, "fail": n_fail, "warn": n_warn}
+        # 알림 정책: 기본은 이상(⚠️/❌)일 때만 발송. healthcheck_alert_only=False면 정상도 발송.
+        _alert_only = getattr(settings, "healthcheck_alert_only", True)
+        _has_issue = (n_fail > 0 or n_warn > 0)
+        if _has_issue or not _alert_only:
+            notifier.send_message("\n".join(lines))
+            _sent = True
+        else:
+            _sent = False
+        logger.info(
+            "🩺 [헬스체크] 점검 완료 — 판정=%s (fail=%d, warn=%d), 텔레그램 발송=%s",
+            verdict, n_fail, n_warn, ("예" if _sent else "아니오(정상, alert_only)"),
+        )
+        return {"status": "healthcheck_done", "verdict": verdict,
+                "fail": n_fail, "warn": n_warn, "telegram_sent": _sent}
 
     except Exception as exc:
         logger.error("❌ [system_health_check_task] 헬스체크 실패: %s", exc, exc_info=True)

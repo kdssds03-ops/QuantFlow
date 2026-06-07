@@ -71,6 +71,10 @@ class Settings(BaseSettings):
     vol_scale_min: float = 0.5                # 사이징 축소 하한 (0.5배)
     vol_scale_max: float = 2.0                # 사이징 확대 상한 (2.0배)
 
+    # 시스템 헬스체크 알림 정책: True면 이상(⚠️/❌)일 때만 텔레그램 발송(정상은 로그만).
+    # False면 매 점검(12h)마다 정상 리포트도 발송(데드맨 스위치 효과).
+    healthcheck_alert_only: bool = True
+
     # ── Logging ──────────────────────────────
     log_level: str = "INFO"
 

@@ -56,14 +56,23 @@ class Settings(BaseSettings):
     risk_factor: float = 0.10
 
     # 일일 최대손실 서킷브레이커: 당일(KST) 시작자본 대비 손실이 이 비율에 도달하면
-    # 자동으로 sys_status=PAUSED로 매매를 동결한다. 0 = 비활성(기본).
-    # 예: 0.05 = -5% 도달 시 당일 매매 중단. 실전에서는 0.03~0.10 설정 강력 권장.
+    # 자동으로 sys_status=PAUSED로 신규 진입을 동결한다(보유 포지션 보호 가드는 유지,
+    # 다음 KST 거래일 자동 재개). 0 = 비활성(기본).
+    # 예: 0.05 = -5% 도달 시 당일 신규 진입 중단. 실전에서는 0.03~0.10 설정 강력 권장.
     max_daily_loss_pct: float = 0.0
+
+    # 자본 방화벽: 단일 심볼 1회 진입 노셔널 ≤ 가용마진 × 이 비율 (초과 시 주문 거부).
+    # 반드시 risk_factor(변동성타겟 ON이면 × vol_scale_max)보다 크게 둘 것 —
+    # 더 작으면 모든 신규 진입이 거부되어 봇이 무거래 상태가 된다 (기동 시 교차 검증 로그 있음).
+    max_capital_per_symbol_pct: float = 0.60
 
     # ── 변동성 타게팅 (동적 사이징) ──────────────────────────────
     # 최근 변동성이 장기평균보다 높으면 진입 사이징을 줄이고, 낮으면 키운다.
     # 평균 사이징은 risk_factor에 유지되며, 변동성에 따라 조절만 한다.
-    # 백테스트(3년): Sharpe 0.68→0.81, 학습·검증 모두 개선(과최적 아님).
+    # ⚠️ 2026-06-12 라이브 충실 재현(진입 시 1회 샘플링, scripts/risk_factor_scenarios.py):
+    #    IS Sharpe 0.75→0.96 개선이나 OOS 0.70→0.51 악화 — 'IS/OOS 동시 우위' 채택 기준
+    #    미달로 기본 OFF. (과거 "0.68→0.81 양 구간 개선" 근거는 매봉 무비용 리밸런싱
+    #    모델이라 라이브의 진입 시 1회 샘플링 구현과 다른 메커니즘이었음)
     # effective_risk = risk_factor * clip(anchor_vol/realized_vol, scale_min, scale_max)
     vol_target_enabled: bool = False          # True 시 동적 사이징 활성
     vol_realized_4h_bars: int = 30            # 실현변동성 추정 4h봉 수 (≈5일)

@@ -6,7 +6,10 @@ TREND 예측기는 4h EMA(30/60) 계산에 ~62개 4h봉(=약 10일 연속 1m)이
 이 스크립트로 data/btc_1m_1year.csv의 과거 구간을 채워 즉시 작동하게 한다.
 
 인디케이터 컬럼은 NULL로 두며(TREND는 close만 사용), 유니크 제약
-(uq_market_data_ts_symbol)으로 기존 데이터와 충돌 시 건너뛴다(ON CONFLICT DO NOTHING).
+(uq_market_data_ts_symbol) 충돌 시 OHLCV를 CSV 값으로 덮어쓴다(ON CONFLICT DO UPDATE).
+— 과거 fetch_market_data_task가 '형성 중 캔들 스냅샷'(고가≈저가≈시가, 거래량≈0)을
+  저장하던 결함으로 오염된 행을 이 스크립트 재실행으로 치유하기 위함이다.
+  지표 컬럼은 건드리지 않는다 (TREND 신호는 close만 사용, 필요 시 warm-up이 재계산).
 
 사용:
   python scripts/backfill_db.py [DB_URL] [start_YYYY-MM-DD] [end_YYYY-MM-DD]
@@ -57,12 +60,17 @@ def main():
                 cur,
                 """INSERT INTO market_data (timestamp, symbol, open, high, low, close, volume)
                    VALUES %s
-                   ON CONFLICT ON CONSTRAINT uq_market_data_ts_symbol DO NOTHING""",
+                   ON CONFLICT ON CONSTRAINT uq_market_data_ts_symbol DO UPDATE SET
+                       open   = EXCLUDED.open,
+                       high   = EXCLUDED.high,
+                       low    = EXCLUDED.low,
+                       close  = EXCLUDED.close,
+                       volume = EXCLUDED.volume""",
                 rows, page_size=5000,
             )
             inserted = cur.rowcount
         conn.commit()
-        print(f"  ✅ 삽입 완료: {inserted:,}행 (중복 제외)")
+        print(f"  ✅ upsert 완료: {inserted:,}행 (기존 행은 OHLCV 갱신)")
         with conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM market_data WHERE symbol=%s", (SYMBOL,))
             total = cur.fetchone()[0]

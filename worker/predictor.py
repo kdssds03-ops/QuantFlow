@@ -848,8 +848,13 @@ class TrendFollowingPredictor(BasePredictor):
         self.ema_fast = ema_fast
         self.ema_slow = ema_slow
         self.tf_min = timeframe_minutes
-        # 상위 TF봉을 (ema_slow + 버퍼)개 확보하기 위한 1분봉 조회량
-        self._query_limit = int(timeframe_minutes * (ema_slow + 20) * 1.2)
+        # 상위 TF봉을 (ema_slow×4 + 버퍼)개 확보하기 위한 1분봉 조회량.
+        # EMA(adjust=False)는 시드 편향이 (1-2/(span+1))^n 으로 감쇠한다.
+        # 과거 (ema_slow+20)≈96봉 윈도는 EMA60에 시드 잔존 ~4%가 남아, 전체 이력으로
+        # 계산하는 백테스트 대비 4h봉의 3.3%에서 신호가 뒤집혔다(2026-06-12 감사,
+        # scripts/audit_trend_fidelity.py). 4×span(≈240봉, 잔존 0.03%) 이상을 확보해
+        # 라이브 신호를 검증된 백테스트와 일치시킨다.
+        self._query_limit = int(timeframe_minutes * (ema_slow * 4 + 20) * 1.05)
         self._min_htf_bars = ema_slow + 2
         self._fallback = RuleBasedPredictor()
         logger.info(
@@ -900,8 +905,13 @@ class TrendFollowingPredictor(BasePredictor):
             from sqlalchemy import desc
             session = self._session_factory()
             try:
+                # 컬럼 튜플 조회 — 풀 ORM 엔티티(수만 개 객체) 머티리얼라이즈를 피해
+                # 매분 호출되는 이 경로의 CPU/메모리 부하를 낮춘다.
                 rows = (
-                    session.query(MarketData)
+                    session.query(
+                        MarketData.timestamp, MarketData.open, MarketData.high,
+                        MarketData.low, MarketData.close, MarketData.volume,
+                    )
                     .filter(MarketData.symbol == symbol)
                     .order_by(desc(MarketData.timestamp))
                     .limit(self._query_limit)
@@ -914,17 +924,16 @@ class TrendFollowingPredictor(BasePredictor):
                 logger.info("⏸️ [TrendFollowing] 캔들 없음 → HOLD (워밍업 대기)")
                 return "HOLD", 0.0
 
-            rows.reverse()  # oldest → newest
             df = pd.DataFrame([
                 {
                     "timestamp_ms": int(
-                        (r.timestamp.astimezone(timezone.utc)
-                         if r.timestamp.tzinfo else
-                         r.timestamp.replace(tzinfo=timezone.utc)).timestamp() * 1000
+                        (r[0].astimezone(timezone.utc)
+                         if r[0].tzinfo else
+                         r[0].replace(tzinfo=timezone.utc)).timestamp() * 1000
                     ),
-                    "open": float(r.open), "high": float(r.high),
-                    "low": float(r.low), "close": float(r.close),
-                    "volume": float(r.volume),
+                    "open": float(r[1]), "high": float(r[2]),
+                    "low": float(r[3]), "close": float(r[4]),
+                    "volume": float(r[5]),
                 }
                 for r in rows
             ]).sort_values("timestamp_ms").reset_index(drop=True)

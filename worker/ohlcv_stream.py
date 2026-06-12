@@ -370,9 +370,14 @@ class OhlcvStreamManager:
 
         q = self._queues[key]
         count = 0
+        # 이 큐는 '확정(마감) 캔들 전용'이다 (WS 경로는 x=true만 적재).
+        # REST fetch_ohlcv의 마지막 행은 형성 중인 미확정 캔들이므로 동일 기준으로 제외.
+        now_ms = int(time.time() * 1000)
         for row in sorted(ohlcv_list, key=lambda x: x[0]):
             try:
                 ts_ms = int(row[0])
+                if ts_ms + 60_000 > now_ms:
+                    continue  # 아직 마감되지 않은 1m 캔들
                 o, h, l, c, v = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5])
                 if any(math.isnan(x) or math.isinf(x) for x in (o, h, l, c, v)):
                     continue

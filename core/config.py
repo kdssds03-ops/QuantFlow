@@ -80,6 +80,20 @@ class Settings(BaseSettings):
     vol_scale_min: float = 0.5                # 사이징 축소 하한 (0.5배)
     vol_scale_max: float = 2.0                # 사이징 확대 상한 (2.0배)
 
+    # ── 멀티심볼 포트폴리오 모드 (분산 + 변동성타게팅) ───────────────────────
+    # 검증된 4h EMA(30/60) 신호를 여러 코인에 분산하고 포트 변동성타게팅으로 합쳐
+    # 단일 BTC 대비 낙폭을 크게 줄인다(메이저4 OOS Sharpe 0.78→1.10 — 검증:
+    # scripts/improve_research.py, scripts/backtest_live.py --portfolio).
+    # ⚠️ 기본 OFF. 켜기 전 (1) 포트 전 심볼의 1m 캔들을 ≥5일 백필(scripts/backfill_db.py),
+    #    (2) beat가 전 심볼을 fetch하는지 확인, (3) sandbox(EXCHANGE_SANDBOX=true)에서
+    #    수주 페이퍼 검증을 먼저 할 것. 라이브 직행 금지.
+    portfolio_mode: bool = False                       # True 시 멀티심볼 포트 사이징 활성
+    portfolio_symbols: str = "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT"  # 쉼표 구분(유동성 메이저4)
+    portfolio_leverage_k: float = 1.0                 # 위험 손잡이(절대수익↔낙폭). 권장 1.0
+    portfolio_target_vol: float = 0.15                # 포트 목표 연변동성
+    portfolio_max_lev: float = 3.0                    # 변동성타겟 레버 상한(내부 계산용)
+    portfolio_max_gross: float = 1.5                  # 총 노출 하드캡(청산 방지). 권장 ≤1.5
+
     # 시스템 헬스체크 알림 정책: True면 이상(⚠️/❌)일 때만 텔레그램 발송(정상은 로그만).
     # False면 매 점검(12h)마다 정상 리포트도 발송(데드맨 스위치 효과).
     healthcheck_alert_only: bool = True
@@ -123,6 +137,12 @@ class Settings(BaseSettings):
         if raw == "*" or not raw:
             return ["*"]
         return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+    @property
+    def portfolio_symbols_list(self) -> list[str]:
+        """쉼표 구분 포트폴리오 심볼 문자열을 리스트로 파싱."""
+        raw = (self.portfolio_symbols or "").strip()
+        return [s.strip() for s in raw.split(",") if s.strip()]
 
 
 @lru_cache()

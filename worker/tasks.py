@@ -44,6 +44,7 @@ from tenacity import (
 )
 
 from sqlalchemy import create_engine, desc
+from sqlalchemy.pool import NullPool
 from sqlalchemy.future import select as sa_select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -91,11 +92,14 @@ except Exception as _r_sync_init_exc:
     logger.warning("⚠️ [Redis 싱글턴] 초기화 실패 → 각 호출부에서 개별 생성으로 폴백: %s", _r_sync_init_exc)
 
 # ── 동기 DB 엔진 구성 ──────────────────────────────────────────────────
+# NullPool: Celery prefork 멀티프로세스에서 부모가 만든 엔진/커넥션을 4개 포크 워커가
+# 공유하면 동시 사용 시 커넥션이 깨진다(psycopg2 'PGRES_TUPLES_OK and no message' 오류).
+# 멀티심볼(PORTFOLIO_MODE)에서 4심볼이 동시에 DB를 치며 이 문제가 드러남 → 풀링을 끄고
+# 세션마다 새 커넥션을 쓰게 한다(async 엔진이 core/database.py에서 NullPool 쓰는 것과 동일 이유).
 _sync_engine = create_engine(
     settings.sync_database_url,
     pool_pre_ping=True,
-    pool_size=5,
-    max_overflow=10,
+    poolclass=NullPool,
 )
 _SyncSession = sessionmaker(bind=_sync_engine, expire_on_commit=False)
 
@@ -288,17 +292,29 @@ if MAX_CAPITAL_PER_SYMBOL_PCT <= Decimal("0") or MAX_CAPITAL_PER_SYMBOL_PCT > De
     MAX_CAPITAL_PER_SYMBOL_PCT = Decimal("0.60")
 
 # 사이징↔방화벽 정합성 사전 점검 — 방화벽이 더 작으면 진입이 전부 거부된다(무거래).
-_max_entry_notional_pct = RISK_FACTOR * (
-    Decimal(str(settings.vol_scale_max)) if settings.vol_target_enabled else Decimal("1")
-)
-if _max_entry_notional_pct > MAX_CAPITAL_PER_SYMBOL_PCT:
-    logger.error(
-        "🚨 [설정 오류] 최대 진입 노셔널 %.0f%%(RISK_FACTOR%s)가 자본 방화벽 %.0f%%를 초과 — "
-        "신규 진입이 전부 거부됩니다. MAX_CAPITAL_PER_SYMBOL_PCT를 올리거나 RISK_FACTOR를 내리세요.",
-        float(_max_entry_notional_pct) * 100,
-        " × vol_scale_max" if settings.vol_target_enabled else "",
-        float(MAX_CAPITAL_PER_SYMBOL_PCT) * 100,
+if getattr(settings, "portfolio_mode", False):
+    # 포트폴리오 모드: 심볼별 사이징은 worker.portfolio가 (자본방화벽×0.95)로 자체 클램프하므로
+    # 단일 RISK_FACTOR 기반 점검은 건너뛴다. 대신 핵심 설정을 기동 로그로 남긴다.
+    logger.info(
+        "📦 [PORTFOLIO_MODE] ON — 심볼=%s, k=%.2f, target_vol=%.0f%%, max_gross=%.2fx, 심볼당캡≈%.0f%%. "
+        "단일 RISK_FACTOR 대신 멀티심볼 리스크패리티+변동성타겟 사이징 사용. "
+        "(전 심볼 1m 백필·페이퍼 검증 선행 필수)",
+        settings.portfolio_symbols_list, float(settings.portfolio_leverage_k),
+        float(settings.portfolio_target_vol) * 100, float(settings.portfolio_max_gross),
+        float(MAX_CAPITAL_PER_SYMBOL_PCT) * 95,
     )
+else:
+    _max_entry_notional_pct = RISK_FACTOR * (
+        Decimal(str(settings.vol_scale_max)) if settings.vol_target_enabled else Decimal("1")
+    )
+    if _max_entry_notional_pct > MAX_CAPITAL_PER_SYMBOL_PCT:
+        logger.error(
+            "🚨 [설정 오류] 최대 진입 노셔널 %.0f%%(RISK_FACTOR%s)가 자본 방화벽 %.0f%%를 초과 — "
+            "신규 진입이 전부 거부됩니다. MAX_CAPITAL_PER_SYMBOL_PCT를 올리거나 RISK_FACTOR를 내리세요.",
+            float(_max_entry_notional_pct) * 100,
+            " × vol_scale_max" if settings.vol_target_enabled else "",
+            float(MAX_CAPITAL_PER_SYMBOL_PCT) * 100,
+        )
 # 슬리페이지 가드: WebSocket 최신가 vs 호가창 스프레드 괴리 허용 한도
 SLIPPAGE_GUARD_PCT         = Decimal("0.001") # 0.1% 초과 시 주문 REJECTED
 
@@ -1354,6 +1370,35 @@ def _vol_target_scale(symbol: str = "BTC/USDT") -> Decimal:
     except Exception as exc:
         logger.warning("⚠️ [변동성타겟] 산출 실패 (배율 1.0 유지): %s", exc)
         return Decimal("1")
+
+
+def _fetch_1m_closes(symbol: str, need_1m: int) -> list:
+    """포트폴리오 사이징(worker.portfolio)용 1m (ts_ms, close) 오름차순 조회.
+    실패 시 빈 리스트 → 호출측이 진입 보류(0)로 안전 처리."""
+    try:
+        session = _SyncSession()
+        try:
+            from sqlalchemy import desc as _desc
+            rows = (
+                session.query(MarketData.timestamp, MarketData.close)
+                .filter(MarketData.symbol == symbol)
+                .order_by(_desc(MarketData.timestamp))
+                .limit(int(need_1m))
+                .all()
+            )
+        finally:
+            session.close()
+        out = []
+        for r in rows:
+            ts = r[0]
+            ms = int((ts.astimezone(timezone.utc) if ts.tzinfo
+                      else ts.replace(tzinfo=timezone.utc)).timestamp() * 1000)
+            out.append((ms, float(r[1])))
+        out.sort(key=lambda x: x[0])
+        return out
+    except Exception as exc:
+        logger.warning("⚠️ [PORTFOLIO] %s 1m 조회 실패: %s", symbol, exc)
+        return []
 
 
 # ─────────────────────────────────────────────
@@ -2869,7 +2914,24 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
             # 7. ⚡ 주문 분기점 정의 및 동적 주문 수량 계산 (Symmetric LONG & SHORT Pipeline)
             # RISK_FACTOR는 모듈 상단에서 .env(settings.risk_factor) 기반으로 정의됨 (위 참조)
             # 변동성 타게팅: 평균은 RISK_FACTOR 유지, 변동성에 따라 사이징 배율 조절 (비활성 시 1.0)
-            _EFFECTIVE_RISK = RISK_FACTOR * _vol_target_scale(symbol)
+            if getattr(settings, "portfolio_mode", False):
+                # 멀티심볼 포트폴리오 사이징 (리스크패리티 + 변동성타겟 + 레버 k, gross 하드캡)
+                # 데이터 부족/오류 시 0.0 반환 → 아래 수량 가드가 진입을 안전 보류.
+                from worker.portfolio import portfolio_effective_risk
+                _EFFECTIVE_RISK = portfolio_effective_risk(
+                    symbol,
+                    symbols=settings.portfolio_symbols_list,
+                    fetch_1m_closes=_fetch_1m_closes,
+                    n_bars=int(settings.vol_realized_4h_bars),
+                    target_vol=float(settings.portfolio_target_vol),
+                    max_lev=float(settings.portfolio_max_lev),
+                    k=float(settings.portfolio_leverage_k),
+                    max_gross=float(settings.portfolio_max_gross),
+                    per_symbol_cap=float(MAX_CAPITAL_PER_SYMBOL_PCT) * 0.95,
+                )
+            else:
+                # 단일 심볼: RISK_FACTOR × 변동성타겟 배율(비활성 시 1.0)
+                _EFFECTIVE_RISK = RISK_FACTOR * _vol_target_scale(symbol)
             _step = _get_lot_size_step(exchange, symbol, fallback_step="0.001")
             
             # 0 나눗셈 및 math.isnan 방어 가드

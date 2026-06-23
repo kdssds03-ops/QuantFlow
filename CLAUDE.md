@@ -5,6 +5,8 @@
 변동성 타게팅(`VOL_TARGET_ENABLED`)은 라이브식(진입 1회 샘플링)이 OOS 열위(Sharpe 0.70→0.51)로 확인되어 **OFF**.
 이전 1m 평균회귀(RULE/ML)는 백테스트상 엣지 0(수수료로 손실)임이 입증되어 교체됨.
 
+**[2026-06-23 추가] 멀티심볼 포트폴리오 모드 (`PORTFOLIO_MODE`, 기본 OFF):** 동일 4h EMA(30/60) 신호를 메이저4(BTC/ETH/SOL/BNB)에 **리스크패리티+포트 변동성타게팅**으로 분산 → 단일 BTC 대비 OOS Sharpe 0.78→**1.10**, 낙폭 대폭↓(검증: `scripts/backtest_live.py --portfolio`, `scripts/improve_research.py`). 절대수익은 `PORTFOLIO_LEVERAGE_K`로 통제(**권장 1.0**; 메이저4는 k>3 시 수익↓·낙폭↑·청산위험 — 8코인과 달리 수익이 DOGE/AVAX에 의존하지 않는 대신 레벨이 낮음). 총노출은 `PORTFOLIO_MAX_GROSS`(기본 1.5x)로 **하드캡(청산 방지)**. 구현: `worker/portfolio.py`(사이징 순수함수, 단위테스트 `scripts/test_portfolio.py`) + `tasks.py` 사이징 주입(`_EFFECTIVE_RISK`) + `_fetch_1m_closes` + `celery_app.py` beat fan-out. **라이브 전 필수:** ① 전 심볼 1m 캔들 ≥5일 백필(`scripts/backfill_db.py`), ② `EXCHANGE_SANDBOX=true` 페이퍼 수주 검증, ③ 통과 시 소액 라이브. 데이터 부족/오류 시 사이징 0(진입 보류)로 안전착지. ⚠️ 사이징은 진입 시 1회 샘플링이라 매봉 리밸런싱 백테스트보다 실측 약간 열위 가능(분산 이득은 유효).
+
 ---
 
 ## ⚠️ 반드시 지킬 규칙 (과거에 실제로 데인 것들 — 반복 금지)

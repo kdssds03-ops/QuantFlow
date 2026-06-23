@@ -58,24 +58,38 @@ celery_app.autodiscover_tasks(["worker"])
 #
 #  거래 시스템에서는 crontab 방식이 더 예측 가능하므로 crontab 사용.
 #
+# ── 거래 심볼 결정: 포트폴리오 모드면 다중 심볼 fan-out, 아니면 BTC 단일(기존) ──
+try:
+    from core.config import get_settings as _get_settings
+    _qf = _get_settings()
+    _trade_symbols = (
+        _qf.portfolio_symbols_list if getattr(_qf, "portfolio_mode", False) else ["BTC/USDT"]
+    ) or ["BTC/USDT"]
+except Exception:
+    _trade_symbols = ["BTC/USDT"]
+
+_beat_trading_tasks = {}
+for _sym in _trade_symbols:
+    _slug = _sym.replace("/", "-").lower()
+    # 매 1분 1m 캔들 수집
+    _beat_trading_tasks[f"fetch-{_slug}-1m-candle"] = {
+        "task": "worker.tasks.fetch_market_data_task",
+        "schedule": crontab(minute="*"),
+        "kwargs": {"symbol": _sym},
+        "options": {"queue": "market_data"},
+    }
+    # 매 60초 시그널 분석 & 자동매매
+    _beat_trading_tasks[f"analyze-and-trade-{_slug}"] = {
+        "task": "worker.tasks.analyze_and_trade",
+        "schedule": 60.0,
+        "kwargs": {"symbol": _sym},
+        "options": {"queue": "trading"},
+    }
+
 celery_app.conf.beat_schedule = {
 
-    # ── 매 1분마다 BTC/USDT 1분 캔들 수집 ─────
-    "fetch-btc-usdt-1m-candle": {
-        "task": "worker.tasks.fetch_market_data_task",
-        "schedule": crontab(minute="*"),   # 매 분 정각 실행
-        "kwargs": {"symbol": "BTC/USDT"},
-        "options": {"queue": "market_data"},
-    },
-
-    # ── 매 1분마다 시그널 분석 & 자동 매매 ──────
-    #    fetch_ohlcv 직후(30초 오프셋)에 실행되도록 interval 사용
-    "analyze-and-trade-btc-usdt": {
-        "task": "worker.tasks.analyze_and_trade",
-        "schedule": 60.0,                  # 매 60초 간격 (시작 시 ~30초 오프셋)
-        "kwargs": {"symbol": "BTC/USDT"},
-        "options": {"queue": "trading"},
-    },
+    # ── 거래 심볼별 수집+매매 (단일 BTC 또는 포트폴리오 fan-out) ──
+    **_beat_trading_tasks,
 
     # ── 매 5분마다 NTP 시간 동기화 확인 ─────────
     "check-time-sync-every-5min": {

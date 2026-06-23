@@ -68,7 +68,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - .:/opt/quantflow
+      # - .:/opt/quantflow   # [Claude 2026-06-23] 바인드마운트 제거 — Windows 파일공유 동시읽기 손상(0xc6 @2955) 회피. 이미지에 구운 코드 사용. ⚠️ 코드 변경 시 'docker compose build' 필요(라이브 리로드 없음).
       # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
       - /opt/quantflow/app/__pycache__
       - /opt/quantflow/core/__pycache__
@@ -113,7 +113,7 @@ services:
       --concurrency=4
       -Q default,trading,market_data
     volumes:
-      - .:/opt/quantflow
+      # - .:/opt/quantflow   # [Claude 2026-06-23] 바인드마운트 제거 — Windows 파일공유 동시읽기 손상(0xc6 @2955) 회피. 이미지에 구운 코드 사용. ⚠️ 코드 변경 시 'docker compose build' 필요(라이브 리로드 없음).
       # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
       - /opt/quantflow/app/__pycache__
       - /opt/quantflow/core/__pycache__
@@ -150,7 +150,7 @@ services:
       -Q listener
       --hostname=listener@%h
     volumes:
-      - .:/opt/quantflow
+      # - .:/opt/quantflow   # [Claude 2026-06-23] 바인드마운트 제거 — Windows 파일공유 동시읽기 손상(0xc6 @2955) 회피. 이미지에 구운 코드 사용. ⚠️ 코드 변경 시 'docker compose build' 필요(라이브 리로드 없음).
       - /opt/quantflow/app/__pycache__
       - /opt/quantflow/core/__pycache__
       - /opt/quantflow/worker/__pycache__
@@ -176,7 +176,7 @@ services:
       --loglevel=${LOG_LEVEL:-INFO}
       --schedule=/tmp/celerybeat-schedule
     volumes:
-      - .:/opt/quantflow
+      # - .:/opt/quantflow   # [Claude 2026-06-23] 바인드마운트 제거 — Windows 파일공유 동시읽기 손상(0xc6 @2955) 회피. 이미지에 구운 코드 사용. ⚠️ 코드 변경 시 'docker compose build' 필요(라이브 리로드 없음).
       # __pycache__ 격리: 호스트 .pyc 캐시가 컨테이너 코드 로딩을 오염시키지 않도록
       - /opt/quantflow/app/__pycache__
       - /opt/quantflow/core/__pycache__

@@ -343,10 +343,155 @@ def load_data():
     raise FileNotFoundError("btc_1m_1year.csv 를 data/ 또는 루트에 두세요.")
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# 멀티심볼 포트폴리오 모드 (4h) — 라이브 검증 EMA30/60을 8코인 바스켓으로 확장
+# ══════════════════════════════════════════════════════════════════════════
+# 근거: PREDICTOR_TYPE=TREND 라이브는 평균회귀 가드(타임아웃·하드TP·타이트SL·
+#   트레일링)를 자동 비활성화하고 '직전 완성 4h봉 EMA교차'로만 의사결정한다
+#   (worker.predictor.TrendFollowingPredictor / 위 _trend_signal_per_bar).
+#   따라서 4h 종가 단위 시뮬은 라이브 TREND 의사결정과 일치한다.
+#   1m 엔진(run_backtest, trend_mode=True)으로 단일 BTC를 교차검증하면 동일 방향·
+#   동급 수치(예: p=0.50 → CAGR≈+28%, MDD≈-35%, Sharpe≈0.6)가 나온다.
+# 합치는 방법: 리스크패리티(변동성 역수 가중) + 포트 연속 변동성타게팅 + 레버 k.
+# look-ahead 차단: 신호 1봉 지연, 모든 변동성 추정 1봉 지연. 수수료 turnover에만.
+# 데이터: data/_basket_4h.json (portfolio_backtest.py와 동일 캐시). 1m 알트 데이터가
+#   없어 4h 캐시를 쓴다(저빈도 4h 전략엔 충분).
+# ──────────────────────────────────────────────────────────────────────────
+import json  # noqa: E402
+
+BASKET_CACHE = PROJECT_ROOT / "data" / "_basket_4h.json"
+BASKET_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT",
+                  "XRP/USDT", "DOGE/USDT", "AVAX/USDT", "LINK/USDT"]
+BPY_4H = 365 * 6          # 4h봉/년 = 2190
+VOL_WIN = 30             # 변동성 추정 롤링 윈도 (4h봉 ≈5일)
+TARGET_VOL = 0.15        # 변동성타게팅 목표 연변동성
+MAX_LEV = 3.0            # VT 레버리지 상한 (안전)
+PORT_SPLIT = 0.60        # IS/OOS 분리점
+
+
+def load_basket_4h():
+    """data/_basket_4h.json → 공통 타임스탬프 close DataFrame (시간오름차순)."""
+    if not BASKET_CACHE.exists():
+        raise FileNotFoundError(
+            f"{BASKET_CACHE} 없음. scripts/portfolio_backtest.py를 한번 실행해 캐시를 생성하세요."
+        )
+    raw = json.loads(BASKET_CACHE.read_text())
+    closes = {}
+    for s, rows in raw.items():
+        d = pd.DataFrame(rows, columns=["ts", "o", "h", "l", "c", "v"]).drop_duplicates("ts")
+        closes[s] = pd.Series(d["c"].values, index=pd.to_datetime(d["ts"], unit="ms", utc=True))
+    return pd.DataFrame(closes).dropna()
+
+
+def _ema_sign(close, fast=30, slow=60):
+    """직전 완성봉 EMA교차 포지션(+1/-1), 1봉 지연(look-ahead 차단)."""
+    ef = close.ewm(span=fast, adjust=False).mean()
+    es = close.ewm(span=slow, adjust=False).mean()
+    return np.sign(ef - es).shift(1).fillna(0.0)
+
+
+def coin_trend_returns(px, fast=30, slow=60, fee=0.0005):
+    """코인별 4h EMA추세 순수익(수수료 차감) DataFrame."""
+    out = {}
+    for s in px.columns:
+        pos = _ema_sign(px[s], fast, slow)
+        r = px[s].pct_change().fillna(0.0)
+        turn = pos.diff().abs().fillna(pos.abs())
+        out[s] = pos * r - turn * fee
+    return pd.DataFrame(out)
+
+
+def vt_portfolio(R, k=1.0):
+    """리스크패리티 + 포트 변동성타게팅 × 레버 k. (R: 코인별 순수익 DataFrame)
+    반환: (port_returns, per_coin_contribution_df)."""
+    vol = R.rolling(VOL_WIN).std().shift(1)
+    inv = 1.0 / vol
+    w = inv.div(inv.sum(axis=1), axis=0)            # 리스크패리티 가중 (1봉 지연 vol)
+    rp = (R * w).sum(axis=1)
+    pvol = rp.rolling(VOL_WIN).std().shift(1) * np.sqrt(BPY_4H)
+    lev = (TARGET_VOL / pvol).clip(upper=MAX_LEV).fillna(0.0)   # 포트 변동성타겟 레버
+    scale = lev * k
+    contrib = R.mul(w, axis=0).mul(scale, axis=0)    # 코인별 기여 (합 = 포트수익)
+    return rp * scale, contrib
+
+
+def port_stats(s):
+    s = s.dropna()
+    if len(s) < 10 or s.std() == 0:
+        return dict(ret=0.0, cagr=0.0, sharpe=0.0, mdd=0.0)
+    eq = (1 + s).cumprod(); yrs = len(s) / BPY_4H
+    return dict(ret=(eq.iloc[-1] - 1) * 100, cagr=(eq.iloc[-1] ** (1 / yrs) - 1) * 100,
+                sharpe=s.mean() / s.std() * np.sqrt(BPY_4H),
+                mdd=(eq / eq.cummax() - 1).min() * 100)
+
+
+def _is_oos(s):
+    k = int(len(s) * PORT_SPLIT)
+    return port_stats(s), port_stats(s.iloc[:k]), port_stats(s.iloc[k:])
+
+
+def run_portfolio(fast=30, slow=60, fee=0.0005):
+    px = load_basket_4h()
+    print(f"\n[포트폴리오 데이터] {len(px)}개 4h봉, {px.index[0].date()}~{px.index[-1].date()}, "
+          f"{len(px.columns)}코인  (IS={int(PORT_SPLIT*100)}%/OOS={int((1-PORT_SPLIT)*100)}%, "
+          f"EMA{fast}/{slow}, 수수료 {fee*100:.3f}%/편도)")
+    R = coin_trend_returns(px, fast, slow, fee)
+    btc = R["BTC/USDT"]
+    vt1, contrib = vt_portfolio(R, k=1.0)
+
+    # ── 교차검증: 단일 BTC (이 4h 엔진) ─────────────────────────────────
+    b = port_stats(btc)
+    print("\n" + "=" * 78)
+    print("교차검증 — 단일 BTC (이 4h엔진) vs 타 산출")
+    print("=" * 78)
+    print(f"  이 엔진 단일BTC      : CAGR {b['cagr']:+.1f}%  MDD {b['mdd']:.1f}%  Sharpe {b['sharpe']:.2f}")
+    print(f"  (대조) improve_research / portfolio_backtest 동일 로직과 일치해야 함")
+    print(f"  (대조) 1m 라이브엔진 TREND p=0.50 ≈ CAGR +28% / MDD -35% / Sharpe 0.60 — 동급")
+
+    # ── 포트폴리오 vs 기준선 (IS/OOS) ───────────────────────────────────
+    print("\n" + "=" * 78)
+    print("포트폴리오 (RP+VT) vs 단일 BTC — 신호 동일, 합치는 법만 변경")
+    print("=" * 78)
+    for name, s in [("단일 BTC (기준선)", btc), ("8코인 RP+VT (k=1)", vt1)]:
+        f, i, o = _is_oos(s)
+        print(f"  {name:<20} CAGR {f['cagr']:+6.1f}%  Sharpe {f['sharpe']:+.2f}  "
+              f"MDD {f['mdd']:6.1f}% | IS {i['sharpe']:+.2f} / OOS {o['sharpe']:+.2f}")
+
+    # ── 절대수익: 레버 k 프런티어 ───────────────────────────────────────
+    base_mdd = abs(b["mdd"])
+    print("\n" + "=" * 78)
+    print(f"절대수익 — 레버 k 프런티어 (기준선 MDD {b['mdd']:.0f}%를 위험예산으로)")
+    print("=" * 78)
+    print(f"  {'k':>4} {'CAGR':>8} {'MDD':>8} {'Sharpe':>7} {'OOS CAGR':>9} {'OOS MDD':>8}")
+    for k in [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0]:
+        sk, _ = vt_portfolio(R, k=k)
+        f, _, o = _is_oos(sk)
+        mark = " ✅MDD≤기준" if abs(f["mdd"]) <= base_mdd else ""
+        print(f"  {k:>4.1f} {f['cagr']:>+7.1f}% {f['mdd']:>+7.1f}% {f['sharpe']:>+6.2f} "
+              f"{o['cagr']:>+8.1f}% {o['mdd']:>+7.1f}%{mark}")
+
+    # ── 코인별 기여 (k=1, 전체구간 누적) ────────────────────────────────
+    print("\n" + "=" * 78)
+    print("코인별 누적 기여 (k=1) — 합 = 포트 총수익. 음(-)이면 분산 비용")
+    print("=" * 78)
+    csum = contrib.sum().sort_values(ascending=False)
+    for s, v in csum.items():
+        print(f"  {s:<10} {v*100:+7.1f}%p")
+    print(f"  {'합계':<10} {csum.sum()*100:+7.1f}%p  (= 포트 총수익 {port_stats(vt1)['ret']:+.1f}%)")
+    print("\n[정직성] 백테스트는 낙관적: 알트 슬리피지·펀딩비·청산·변동성드래그 미반영.")
+    print("         레버는 양날 — k가 클수록 OOS 낙폭도 그만큼 커진다. 페이퍼 검증 필수.")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--experiments", action="store_true", help="개선안 비교 실행")
+    ap.add_argument("--portfolio", action="store_true",
+                    help="멀티심볼 포트폴리오 모드(4h, RP+VT+레버k) 실행")
     args = ap.parse_args()
+
+    if args.portfolio:
+        run_portfolio()
+        return
 
     df = load_data()
     df = compute_all_features(df)

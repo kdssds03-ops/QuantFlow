@@ -3,6 +3,12 @@
 24시간 무중단 가동을 위해 봇을 노트북에서 **Oracle Cloud Always Free ARM VM**으로 이전한다.
 스택(postgres/redis/api/worker/beat/listener-worker)은 ARM64에서 코드 수정 없이 구동됨(검증 완료).
 
+> ### ⚠️ 2026-06-23 업데이트 (현재 코드 기준 — 반드시 반영)
+> - **전략**: 단일 BTC 외에 **멀티심볼 포트폴리오 모드(`PORTFOLIO_MODE`)** 사용 가능 — 메이저4(BTC/ETH/SOL/BNB)의 4h EMA 추세를 리스크패리티+변동성타게팅으로 분산(메이저4 OOS Sharpe 0.78→1.10). `.env`로 켠다(아래 5번).
+> - **베이크 코드로 전환**: `docker-compose.yml`에서 코드 바인드마운트(`- .:/opt/quantflow`)를 제거했다(Windows 파일공유 인코딩 손상 회피). 따라서 **코드 변경 반영 = `git pull && docker compose build && docker compose up -d`** (단순 `restart` 아님 — 아래 8번). 💡 리눅스 전용이면 compose에서 `# - .:/opt/quantflow` 4줄의 주석을 풀어 바인드마운트를 되살리고 기존 `restart` 워크플로를 써도 된다(리눅스엔 그 버그 없음, 택1).
+> - **데이터 백필**: 포트폴리오 모드는 전 심볼 1m이 필요 → `python scripts/backfill_symbol_1m.py "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" 45` (≥45일 권장; 컨테이너 내 실행은 `docker compose run --rm --entrypoint python worker scripts/backfill_symbol_1m.py ...`).
+> - **순서 불변**: 무조건 `EXCHANGE_SANDBOX=true`(데모)로 먼저 수주 검증 → 통과 시에만 실자금.
+
 ---
 
 ## 0. 사전 준비
@@ -47,17 +53,21 @@ docker compose up -d   # 최초 빌드(ARM 컴파일로 수 분 소요) 후 가�
 
 ## 5. .env 핵심 설정 (실전 기준)
 ```
-EXCHANGE_SANDBOX=false              # 데모로 먼저 검증하려면 true 유지
-EXCHANGE_API_KEY=<실계정 키>
-EXCHANGE_API_SECRET=<실계정 시크릿>
+EXCHANGE_SANDBOX=true               # ★먼저 데모(테스트넷)로 수주 검증. 실자금은 통과 후에만 false
+EXCHANGE_API_KEY=<API 키>           # 데모면 테스트넷 키, 실전이면 실계정 키
+EXCHANGE_API_SECRET=<API 시크릿>
 PREDICTOR_TYPE=TREND
-RISK_FACTOR=0.05                    # 처음엔 보수적으로
-VOL_TARGET_ENABLED=true
-MAX_DAILY_LOSS_PCT=0.05             # 서킷브레이커
+MAX_DAILY_LOSS_PCT=0.05             # 일일 손실 서킷브레이커
 TELEGRAM_BOT_TOKEN=<토큰>
 TELEGRAM_CHAT_ID=<챗ID>
 SECRET_KEY=<랜덤 32자>
-# 데모용 BINANCE_URLS_API_FUTURES 줄은 실전 시 삭제
+
+# ── 멀티심볼 포트폴리오 모드 (권장) ──
+PORTFOLIO_MODE=true
+PORTFOLIO_SYMBOLS=BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT
+PORTFOLIO_LEVERAGE_K=1.0           # 위험 손잡이(권장 1.0; 메이저4는 k>2~3 비효율)
+PORTFOLIO_MAX_GROSS=1.5            # 총노출 하드캡(청산 방지)
+# 단일 BTC만 쓰려면: PORTFOLIO_MODE=false, RISK_FACTOR=0.05, VOL_TARGET_ENABLED=false
 ```
 
 ## 6. 보안 (실자금 — 필수)
@@ -75,11 +85,13 @@ python scripts/preflight.py            # One-Way 모드·레버리지·DB·API�
 docker compose logs -f worker          # TREND 신호·매매 로그 관찰
 ```
 - 거래소에서 **One-Way 포지션 모드** + **레버리지 1~3x** 설정(봇은 안 건드림).
-- TREND은 4h봉 ~62개(≈10일 1m) 필요 → 부족하면 `python scripts/backfill_db.py`로 백필.
+- TREND은 4h봉 ~62개(≈10일 1m) 필요(백테스트 충실엔 ~43일). 부족하면 백필:
+  - 포트폴리오(메이저4): `docker compose run --rm --entrypoint python worker scripts/backfill_symbol_1m.py "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" 45`
+  - 단일 BTC: `python scripts/backfill_db.py`
 
 ## 8. 운영 메모
 - **자동 재시작**: `restart: unless-stopped` 설정돼 있어 인스턴스 재부팅 시 자동 복구.
-- **코드 변경 반영**: `git pull && docker compose restart <svc>` (PYTHONDONTWRITEBYTECODE 적용으로 restart면 충분).
+- **코드 변경 반영**(베이크 코드 기준): `git pull && docker compose build && docker compose up -d` — 바인드마운트를 제거했으므로 `restart`로는 코드가 반영되지 않는다. ※ compose에서 바인드마운트를 되살린 경우엔 `git pull && docker compose restart <svc>`로 충분.
 - **.env 변경 반영**: `docker compose up -d <svc>` (restart 아님).
 - **로그 비대 방지**(선택): docker-compose 각 서비스에 logging 옵션 추가
   ```yaml

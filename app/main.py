@@ -11,7 +11,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import get_settings
 from core.database import engine, Base
 from core.redis import redis_client
-from core.time_sync import check_ntp_drift
 from app.api import router as api_router
 
 settings = get_settings()
@@ -36,14 +35,6 @@ async def lifespan(app: FastAPI):
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
         logger.info("📦 DB 테이블 생성 완료 (debug 모드)")
-
-    # NTP 시간 차이 확인
-    import asyncio
-    drift = await asyncio.to_thread(check_ntp_drift)
-    if drift is not None:
-        logger.info(f"⏱  NTP drift: {drift:.1f}ms")
-    else:
-        logger.warning("⏱  NTP drift: 측정 불가 (모든 NTP 서버 응답 없음)")
 
     yield
 

@@ -1,10 +1,10 @@
 """
 scripts/backfill_symbol_1m.py — 임의 심볼 1m OHLCV를 바이낸스에서 받아 DB(market_data)에 upsert.
 
-기존 backfill_db.py(BTC·CSV 전용) / fetch_ohlcv.py(BTC·CSV 출력)로는 포트폴리오 모드의
-ETH/SOL/BNB 1m 백필이 불가하여 추가. 두 스크립트의 '검증된 패턴'을 그대로 재사용한다:
+BTC 단일·포트폴리오 공용 백필 도구 (구 backfill_db.py/backfill_data.py 대체).
   - 페이지네이션: cur = batch[-1][0] + 60_000  (fetch_ohlcv.py — 조기종료 버그 없음)
-  - upsert     : ON CONFLICT ON CONSTRAINT uq_market_data_ts_symbol DO UPDATE (backfill_db.py)
+  - upsert     : ON CONFLICT ON CONSTRAINT uq_market_data_ts_symbol DO UPDATE
+                 (오염된 과거 OHLCV도 재실행으로 치유)
 
 ⚠️ CLAUDE.md 데이터 함정 준수:
   - 완성봉만 저장: ts + 60_000 <= now_ms 필터 (형성 중 캔들 오염 방지)

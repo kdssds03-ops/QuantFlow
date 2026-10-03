@@ -5,7 +5,7 @@
 변동성 타게팅(`VOL_TARGET_ENABLED`)은 라이브식(진입 1회 샘플링)이 OOS 열위(Sharpe 0.70→0.51)로 확인되어 **OFF**.
 이전 1m 평균회귀(RULE/ML)는 백테스트상 엣지 0(수수료로 손실)임이 입증되어 교체됨.
 
-**[2026-06-23 추가] 멀티심볼 포트폴리오 모드 (`PORTFOLIO_MODE`, 기본 OFF):** 동일 4h EMA(30/60) 신호를 메이저4(BTC/ETH/SOL/BNB)에 **리스크패리티+포트 변동성타게팅**으로 분산 → 단일 BTC 대비 OOS Sharpe 0.78→**1.10**, 낙폭 대폭↓(검증: `scripts/backtest_live.py --portfolio`, `scripts/improve_research.py`). 절대수익은 `PORTFOLIO_LEVERAGE_K`로 통제(**권장 1.0**; 메이저4는 k>3 시 수익↓·낙폭↑·청산위험 — 8코인과 달리 수익이 DOGE/AVAX에 의존하지 않는 대신 레벨이 낮음). 총노출은 `PORTFOLIO_MAX_GROSS`(기본 1.5x)로 **하드캡(청산 방지)**. 구현: `worker/portfolio.py`(사이징 순수함수, 단위테스트 `scripts/test_portfolio.py`) + `tasks.py` 사이징 주입(`_EFFECTIVE_RISK`) + `_fetch_1m_closes` + `celery_app.py` beat fan-out. **라이브 전 필수:** ① 전 심볼 1m 캔들 ≥5일 백필(`scripts/backfill_db.py`), ② `EXCHANGE_SANDBOX=true` 페이퍼 수주 검증, ③ 통과 시 소액 라이브. 데이터 부족/오류 시 사이징 0(진입 보류)로 안전착지. ⚠️ 사이징은 진입 시 1회 샘플링이라 매봉 리밸런싱 백테스트보다 실측 약간 열위 가능(분산 이득은 유효).
+**[2026-06-23 추가] 멀티심볼 포트폴리오 모드 (`PORTFOLIO_MODE`, 기본 OFF):** 동일 4h EMA(30/60) 신호를 메이저4(BTC/ETH/SOL/BNB)에 **리스크패리티+포트 변동성타게팅**으로 분산 → 단일 BTC 대비 OOS Sharpe 0.78→**1.10**, 낙폭 대폭↓(검증: `scripts/backtest_live.py --portfolio`, `scripts/improve_research.py`). 절대수익은 `PORTFOLIO_LEVERAGE_K`로 통제(**권장 1.0**; 메이저4는 k>3 시 수익↓·낙폭↑·청산위험 — 8코인과 달리 수익이 DOGE/AVAX에 의존하지 않는 대신 레벨이 낮음). 총노출은 `PORTFOLIO_MAX_GROSS`(기본 1.5x)로 **하드캡(청산 방지)**. 구현: `worker/portfolio.py`(사이징 순수함수, 단위테스트 `scripts/test_portfolio.py`) + `tasks.py` 사이징 주입(`_EFFECTIVE_RISK`) + `_fetch_1m_closes` + `celery_app.py` beat fan-out. **라이브 전 필수:** ① 전 심볼 1m 캔들 ≥5일 백필(`scripts/backfill_symbol_1m.py`), ② `EXCHANGE_SANDBOX=true` 페이퍼 수주 검증, ③ 통과 시 소액 라이브. 데이터 부족/오류 시 사이징 0(진입 보류)로 안전착지. ⚠️ 사이징은 진입 시 1회 샘플링이라 매봉 리밸런싱 백테스트보다 실측 약간 열위 가능(분산 이득은 유효).
 
 ---
 
@@ -27,7 +27,7 @@
 - 리샘플 결과 봉 수가 비정상(예: 수천 행인데 1봉)이면 **즉시 타임스탬프 변환부터 의심**.
 
 ### 데이터/백테스트 — "너무 좋은 결과 = 버그/과최적" 먼저 의심
-- **1m 수집은 완성봉만 저장**(`ts+60s <= now` 필터) + conflict 시 OHLCV도 갱신할 것. 과거 `fetch_market_data_task`가 형성 중 캔들 스냅샷(고가≈저가≈시가, 거래량≈0)을 INSERT하고 conflict 시 지표만 갱신해 **DB OHLCV가 영구 오염**됐었다(2026-06-12 수정). 오염 과거 구간은 `backfill_db.py`(현재 DO UPDATE) 재실행으로 치유.
+- **1m 수집은 완성봉만 저장**(`ts+60s <= now` 필터) + conflict 시 OHLCV도 갱신할 것. 과거 `fetch_market_data_task`가 형성 중 캔들 스냅샷(고가≈저가≈시가, 거래량≈0)을 INSERT하고 conflict 시 지표만 갱신해 **DB OHLCV가 영구 오염**됐었다(2026-06-12 수정). 오염 과거 구간은 `backfill_symbol_1m.py`(현재 DO UPDATE) 재실행으로 치유.
 - 수집 함수의 페이지네이션 버그로 **5.5개월치를 연율화해 AVAX +1016% 같은 거짓 수치**를 낼 뻔함(`len(b)<limit: break`가 첫 배치에서 조기 종료).
 - **백테스트 수치를 믿기 전 반드시**: ① 수집 데이터의 **날짜 범위·행 수**를 출력해 확인, ② 결과가 화려하면 **내부 정합성 교차검증**(예: 같은 자산을 두 방법으로).
 - 전략/파라미터 개선은 **학습/검증(IS/OOS) 분리 + 파라미터 고원**으로 검증. 한 값만 좋으면(예: ADX≥20만) 과최적이다. 단순함을 우선.
@@ -46,7 +46,7 @@
 - **인프라(컨테이너 내부 통신)**: `POSTGRES_HOST=postgres`, `REDIS_URL=redis://redis:6379/0`. 호스트에서 직접 붙을 땐 `localhost`로 오버라이드.
 - **스택**: postgres, redis, api(+alembic 마이그레이션 담당), worker(매매), listener-worker(텔레그램), beat(스케줄).
 - **전략 토글(.env)**: `PREDICTOR_TYPE=TREND`, `RISK_FACTOR`(사이징, 현행 0.50), `VOL_TARGET_ENABLED=false`(현행), `MAX_DAILY_LOSS_PCT`(서킷브레이커, 현행 0.05), `MAX_CAPITAL_PER_SYMBOL_PCT`(자본 방화벽, 현행 0.60 — **반드시 RISK_FACTOR×vol_scale_max보다 클 것**, 작으면 전 주문 거부=무거래).
-- **TREND 워밍업**: 신호 발화 최소 4h봉 ≥62개(≈10일 연속 1m), **백테스트와 EMA 일치엔 260개(≈43일) 필요**(predictor가 그만큼 조회 — 짧으면 EMA 시드 편향으로 4h봉의 ~3%에서 신호 뒤집힘). `scripts/backfill_db.py`로 과거 1m 백필 가능.
+- **TREND 워밍업**: 신호 발화 최소 4h봉 ≥62개(≈10일 연속 1m), **백테스트와 EMA 일치엔 260개(≈43일) 필요**(predictor가 그만큼 조회 — 짧으면 EMA 시드 편향으로 4h봉의 ~3%에서 신호 뒤집힘). `scripts/backfill_symbol_1m.py`로 과거 1m 백필 가능.
 - **TREND 모드 자동 비활성 가드**: 타임아웃·하드TP·타이트SL·트레일링·**불타기(피라미딩)**. 피라미딩은 IS/OOS 분리 검증에서 과최적 기각(검증구간 전 지표 열위) — 재검토 시 `python scripts/audit_trend_fidelity.py --split-only` 재실행.
 - **실전 전 점검**: `python scripts/preflight.py` (One-Way 모드·레버리지·DB신선도·API키 등).
 - **검증 도구**: `scripts/backtest_live.py`(라이브 로직 충실 재현), `signal_research.py`/`regime_validation.py`/`portfolio_backtest.py`(엣지·국면·분산 검증), `fetch_ohlcv.py`(데이터 수집).

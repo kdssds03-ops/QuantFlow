@@ -16,7 +16,7 @@ worker.portfolio — 멀티심볼 포트폴리오 사이징 (리스크패리티 
 
 ⚠️ 데이터 전제: 포트 심볼 전부의 1m 캔들이 DB에 ≥5일 쌓여 있어야 vol 추정이 됨.
    부족 시 이 함수는 0.0(=진입 보류)을 반환 → 워밍업 안전.
-   (beat가 모든 심볼을 fetch + scripts/backfill_db.py로 초기 백필 필요)
+   (beat가 모든 심볼을 fetch + scripts/backfill_symbol_1m.py로 초기 백필 필요)
 
 순수 stdlib + pandas/numpy 의존 (DB/Redis는 콜백 주입) → 단위검증 가능.
 """

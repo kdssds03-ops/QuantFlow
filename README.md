@@ -19,9 +19,9 @@ QuantFlow는 실시간 금융 시계열 데이터 파이프라인 수집, 머신
 
 ## 💡 Key Architectural Safeguards (핵심 가드 아키텍처)
 
-### 1. 🛡️ 파일 시스템 기반 부팅 멱등성 가드 (Idempotency Shield)
+### 1. 🛡️ Redis 기반 부팅 멱등성 가드 (Idempotency Shield)
 
-Celery `prefork` 실행 모델의 프로세스 분기 및 모듈 재평가로 인한 텔레그램 알림 도배 장해를 방지하기 위해, 로컬 파일 시스템 마킹(`.welcome_sent`) 매커니즘을 구축하여 인프라 부팅 시 **생애 최초 단 1회의 알림만 발송**되도록 통제합니다.
+Celery `prefork` 실행 모델의 프로세스 분기 및 모듈 재평가로 인한 텔레그램 알림 도배 장해를 방지하기 위해, Redis `SET NX`(24h TTL) 플래그로 인프라 부팅 시 **단 1회의 알림만 발송**되도록 통제합니다.
 
 ### ⛓️ 2. 단독 책임 체인 의존성 인프라 (Dependency Chain Lifecycle)
 

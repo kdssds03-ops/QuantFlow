@@ -4,7 +4,7 @@ Celery 태스크를 트리거하고 상태를 조회하는 REST API
 """
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 # ⚠️ [순환 참조 가드] worker.tasks는 최상단 글로벌 레벨에서 임포트하지 않음.
 # worker.tasks 모듈은 초기화 시 core/database, celery_app 등을 연쇄 로드하므로
@@ -16,11 +16,8 @@ router = APIRouter(prefix="/trading")
 
 # ── Schemas ──────────────────────────────────
 class TradeRequest(BaseModel):
-    symbol: str = Field(..., example="BTC/USDT", description="거래 심볼")
-    side: str = Field(..., example="buy", description="매수(buy) / 매도(sell)")
-    amount: float = Field(..., gt=0, example=0.001, description="주문 수량")
-    order_type: str = Field(default="market", example="market", description="주문 유형")
-    price: float | None = Field(default=None, example=50000.0, description="지정가 (limit일 때)")
+    # 방향·수량은 전략(analyze_and_trade)이 결정한다 — 요청은 심볼만 받는다.
+    symbol: str = "BTC/USDT"
 
 
 class TaskResponse(BaseModel):
@@ -33,7 +30,7 @@ class TaskResponse(BaseModel):
 @router.post("/order", response_model=TaskResponse)
 async def create_order(req: TradeRequest):
     """
-    매매 주문을 Celery 태스크로 전달.
+    해당 심볼의 분석·매매 태스크(analyze_and_trade)를 즉시 1회 트리거.
     즉시 task_id를 반환하고 비동기로 실행.
     """
     # [순환 참조 방어 가드] 함수 호출 시점에 지연 임포트
@@ -43,7 +40,7 @@ async def create_order(req: TradeRequest):
     return TaskResponse(
         task_id=task.id,
         status="queued",
-        message=f"{req.side.upper()} {req.amount} {req.symbol} 주문 분석 태스크가 큐에 등록됨",
+        message=f"{req.symbol} 분석·매매 태스크가 큐에 등록됨",
     )
 
 

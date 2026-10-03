@@ -84,7 +84,7 @@ class Settings(BaseSettings):
     # 검증된 4h EMA(30/60) 신호를 여러 코인에 분산하고 포트 변동성타게팅으로 합쳐
     # 단일 BTC 대비 낙폭을 크게 줄인다(메이저4 OOS Sharpe 0.78→1.10 — 검증:
     # scripts/improve_research.py, scripts/backtest_live.py --portfolio).
-    # ⚠️ 기본 OFF. 켜기 전 (1) 포트 전 심볼의 1m 캔들을 ≥5일 백필(scripts/backfill_db.py),
+    # ⚠️ 기본 OFF. 켜기 전 (1) 포트 전 심볼의 1m 캔들을 ≥5일 백필(scripts/backfill_symbol_1m.py),
     #    (2) beat가 전 심볼을 fetch하는지 확인, (3) sandbox(EXCHANGE_SANDBOX=true)에서
     #    수주 페이퍼 검증을 먼저 할 것. 라이브 직행 금지.
     portfolio_mode: bool = False                       # True 시 멀티심볼 포트 사이징 활성

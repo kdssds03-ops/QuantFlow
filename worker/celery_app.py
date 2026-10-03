@@ -36,10 +36,8 @@ celery_app.conf.update(
 
     # 큐 라우팅
     task_routes={
-        "worker.tasks.execute_trade_task":    {"queue": "trading"},
         "worker.tasks.fetch_market_data_task": {"queue": "market_data"},
         "worker.tasks.analyze_and_trade":     {"queue": "trading"},
-        "worker.tasks.check_time_sync_task":  {"queue": "default"},
         "worker.tasks.generate_daily_report_task": {"queue": "default"},
         # [Deadlock 근본 차단] 텔레그램 리스너 전용 큐 분리
         # trading/market_data/default 워커와 슬롯 공유 완전 차단
@@ -59,14 +57,9 @@ celery_app.autodiscover_tasks(["worker"])
 #  거래 시스템에서는 crontab 방식이 더 예측 가능하므로 crontab 사용.
 #
 # ── 거래 심볼 결정: 포트폴리오 모드면 다중 심볼 fan-out, 아니면 BTC 단일(기존) ──
-try:
-    from core.config import get_settings as _get_settings
-    _qf = _get_settings()
-    _trade_symbols = (
-        _qf.portfolio_symbols_list if getattr(_qf, "portfolio_mode", False) else ["BTC/USDT"]
-    ) or ["BTC/USDT"]
-except Exception:
-    _trade_symbols = ["BTC/USDT"]
+_trade_symbols = (
+    settings.portfolio_symbols_list if settings.portfolio_mode else ["BTC/USDT"]
+) or ["BTC/USDT"]
 
 _beat_trading_tasks = {}
 for _sym in _trade_symbols:
@@ -90,13 +83,6 @@ celery_app.conf.beat_schedule = {
 
     # ── 거래 심볼별 수집+매매 (단일 BTC 또는 포트폴리오 fan-out) ──
     **_beat_trading_tasks,
-
-    # ── 매 5분마다 NTP 시간 동기화 확인 ─────────
-    "check-time-sync-every-5min": {
-        "task": "worker.tasks.check_time_sync_task",
-        "schedule": crontab(minute="*/5"),  # 0, 5, 10, 15 ... 분
-        "options": {"queue": "default"},
-    },
 
     # ── 매일 23:59(Asia/Seoul) 일간 결산 리포트 ────────
     "daily-report-2359": {

@@ -13,10 +13,6 @@ Phase 5 (Timezone & Warmup Fix):
   - OHLCV 수집 limit 500봉으로 확대 → EMA50/SMA20 warm-up NaN 원천 차단
 
 Phase 6 (Zero-I/O Latency & Numpy 고속화):
-  - ohlcv_stream.OhlcvStreamManager 연동: WebSocket 인메모리 큐 우선 참조
-    · REST fetch_ohlcv() 폴링 제거 → HTTP 왕복 50~300ms 지연 제거
-    · deque(maxlen=500) 스냅샷 조회 → 0ms 근접 데이터 접근
-    · 큐 미달 시 REST Fallback 자동 수행
   - ta 라이브러리 완전 제거: indicators.compute_all_features()로
     ATR/MACD 연산 일원화 (순수 Numpy Wilder 스무딩 기반)
   - _get_lot_size_step() 헬퍼: 거래소별 Lot Size를 동적 연동하여
@@ -55,22 +51,7 @@ from core.database import async_session as _async_session_factory
 from worker.celery_app import celery_app
 from core.config import get_settings
 from core.exchange import get_exchange
-from core.time_sync import check_ntp_drift
 from app.models.models import MarketData, TradeHistory
-
-# [Phase 6] WebSocket 인메모리 큐 레이어 연동
-# 이 import는 모듈 로드 시 WebSocket 스트림매니저 싱글턴이 인스턴스화됩니다.
-# ohlcv_stream_manager.start() — 필요 시 명시적으로 호출하여 WebSocket 연결을 시작합니다.
-try:
-    from worker.ohlcv_stream import ohlcv_stream_manager as _ohlcv_stream
-    if _ohlcv_stream is not None:
-        _ohlcv_stream.start(["BTC/USDT"])
-    logging.getLogger(__name__).info("⚡ [OhlcvStream] 인메모리 큐 레이어 로드 및 스트림 시작 완료")
-except ImportError:
-    _ohlcv_stream = None
-    logging.getLogger(__name__).warning(
-        "⚠️ [OhlcvStream] ohlcv_stream 모듈 미설치 — REST Fallback 모드로 가동"
-    )
 
 # [관심사 분리] 실시간 텔레그램 알림 모듈 결합
 from core.notifier import notifier
@@ -185,11 +166,9 @@ try:
     # 24시간(86400초) 동안 웰컴 키 유지하여 봇이 자주 재시작할 때 스팸 방지
     _welcome_already_sent = not _r_welcome.set(_WELCOME_REDIS_KEY, "sent", ex=86400, nx=True)
 except Exception as _welcome_redis_exc:
-    # 만약 Redis가 점검 중이거나 접속 실패하면, 컨테이너별 로컬 임시파일 시스템으로 자동 폴백
-    logger.warning("⚠️ [웰컴 알림] Redis 플래그 확인 실패 → 로컬 파일 시스템으로 폴백합니다: %s", _welcome_redis_exc)
-    import tempfile
-    _WELCOME_FLAG_FILE = os.path.join(tempfile.gettempdir(), "quantflow_welcome_sent")
-    _welcome_already_sent = os.path.exists(_WELCOME_FLAG_FILE)
+    # Redis 없이는 중복 발송을 막을 수 없으므로 웰컴 알림을 생략한다.
+    logger.warning("⚠️ [웰컴 알림] Redis 플래그 확인 실패 → 웰컴 알림 생략: %s", _welcome_redis_exc)
+    _welcome_already_sent = True
 
 if not _welcome_already_sent:
     try:
@@ -203,14 +182,6 @@ if not _welcome_already_sent:
             f"• <b>환경 변수 PREDICTOR_TYPE:</b> <code>{os.getenv('PREDICTOR_TYPE', 'RULE (기본값)')}</code>\n"
             "━━━━━━━━━━━━━━━━━━━━"
         )
-        # Redis 연결 문제로 로컬 파일로 폴백한 경우 파일 생성
-        try:
-            if 'tempfile' in locals() or '_WELCOME_FLAG_FILE' in locals():
-                with open(_WELCOME_FLAG_FILE, "w") as _f:
-                    from datetime import datetime as _dt
-                    _f.write(f"sent at {_dt.now().isoformat()}")
-        except Exception:
-            pass
         logger.info("🚩 [웰컴 알림] 글로벌 가동 완료 메시지 전송 성공")
     except Exception as _e:
         # 전송 실패 시 Redis 키 삭제하여 재시도 가능하게 조치
@@ -220,7 +191,7 @@ if not _welcome_already_sent:
         except Exception:
             pass
 else:
-    logger.debug("🚩 [웰컴 알림] 글로벌/로컬 플래그 감지 — 중복 발송 차단")
+    logger.debug("🚩 [웰컴 알림] 글로벌 플래그 감지 — 중복 발송 차단")
 
 # ── [Strict Rules] 정밀도 유지 및 리스크 관리 임계치 설정 ────────────────
 TRADE_AMOUNT_BTC = Decimal("0.001")     # 일반 float(0.001)에서 Decimal 구조로 정형화
@@ -1161,18 +1132,7 @@ def _get_futures_margin_balance(exchange: "ccxt.Exchange") -> tuple[Decimal, Dec
 
     if spot_btc > Decimal("0"):
         btc_price = Decimal("0")
-        # 1순위: WebSocket 인메모리 큐 최신가 참조 (0ms 지연)
-        try:
-            if _ohlcv_stream:
-                key = _ohlcv_stream._normalize("BTC/USDT")
-                q = _ohlcv_stream._queues.get(key)
-                if q and len(q) > 0:
-                    btc_price = Decimal(str(q[-1][4]))  # index 4 is close price
-                    logger.info(f"⚡ [BTC 실시간 시세] WebSocket 인메모리 큐 최신가 참조 성공: {btc_price} USDT")
-        except Exception as ws_err:
-            logger.warning(f"⚠️ [BTC 실시간 시세] WebSocket 큐 조회 실패: {ws_err}")
-
-        # 2순위 Fallback: ccxt.fetch_ticker REST API
+        # ccxt.fetch_ticker REST API
         if btc_price <= Decimal("0"):
             try:
                 ticker = exchange.fetch_ticker("BTC/USDT")
@@ -1660,7 +1620,7 @@ except Exception as _warmup_exc:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# 📡 시세 데이터 수집 & DB 저장 [Phase 6: WebSocket 큐 우선, ta 완전 제거]
+# 📡 시세 데이터 수집 & DB 저장 [REST, ta 완전 제거]
 # ──────────────────────────────────────────────────────────────────────────
 @celery_app.task(
     bind=True,
@@ -1671,9 +1631,7 @@ except Exception as _warmup_exc:
 )
 def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
     """
-    [Phase 6 구조]
-    1순위: WebSocket 인메모리 큐(deque)에서 OHLCV DataFrame 직접 조회 (0ms 근접)
-    2순위: 큐 미성숙 또는 스트림 미활성 시 REST API Fallback (기존 동작 보존)
+    REST fetch_ohlcv(1m, 500봉) → 완성봉만 지표 계산 후 DB upsert.
 
     [ta 라이브러리 완전 제거]
     - ta.volatility.average_true_range() → indicators.compute_all_features() 통합 ATR
@@ -1684,42 +1642,18 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
     try:
         from worker.indicators import compute_all_features
 
-        # ── 단계 1: WebSocket 인메모리 큐 우선 참조 (0ms 근접) ────────────────
-        df = None
-        _data_source = "REST-Fallback"
-        if _ohlcv_stream is not None and _ohlcv_stream.is_alive(symbol):
-            df = _ohlcv_stream.get_latest_df(symbol=symbol, min_candles=60)
-            if df is not None:
-                _data_source = "WS-Queue"
-                logger.debug(
-                    "⚡ [fetch_market_data] WebSocket 큐 사용 — %d봉 (레이턴시 0ms)",
-                    len(df),
-                )
+        exchange = get_exchange()
+        ohlcv_list = exchange.fetch_ohlcv(symbol=symbol, timeframe="1m", limit=500)
 
-        # ── 단계 2: REST API Fallback (큐 미성숙 시) ──────────────────────────
-        if df is None:
-            logger.info(
-                "📡 [fetch_market_data] REST Fallback 실행 (WS 큐 미성숙) — %s", symbol,
-            )
-            exchange = get_exchange()
-            ohlcv_list = exchange.fetch_ohlcv(symbol=symbol, timeframe="1m", limit=500)
+        if not ohlcv_list:
+            logger.warning(f"⚠️ 빈 OHLCV 응답: {symbol}")
+            return {"status": "empty", "symbol": symbol}
 
-            if not ohlcv_list:
-                logger.warning(f"⚠️ 빈 OHLCV 응답: {symbol}")
-                return {"status": "empty", "symbol": symbol}
-
-            df = pd.DataFrame(
-                ohlcv_list,
-                columns=["timestamp_ms", "open", "high", "low", "close", "volume"],
-            ).astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
-            df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
-
-            # REST Fallback 시 WebSocket 큐도 함께 탁우기 (살아있으면)
-            if _ohlcv_stream is not None:
-                try:
-                    _ohlcv_stream.seed_from_rest(symbol, ohlcv_list)
-                except Exception as _seed_exc:
-                    logger.warning("⚠️ [OhlcvStream] REST seed 실패 (무시): %s", _seed_exc)
+        df = pd.DataFrame(
+            ohlcv_list,
+            columns=["timestamp_ms", "open", "high", "low", "close", "volume"],
+        ).astype({"open": float, "high": float, "low": float, "close": float, "volume": float})
+        df = df.sort_values("timestamp_ms", ascending=True).reset_index(drop=True)
 
         # ── [데이터 정합성] 미완성(진행 중) 캔들 제거 ───────────────────────
         # REST fetch_ohlcv의 마지막 행은 '지금 형성 중'인 캔들이라 OHLCV가 미확정이다.
@@ -1808,8 +1742,8 @@ def fetch_market_data_task(self, symbol: str = "BTC/USDT"):
         candle_dt = _ensure_utc(int(last["timestamp_ms"]))
         _last_atr = _safe_dec(last, "atr_14")
         logger.info(
-            "✅ [fetch_market_data] 완료 — symbol=%s, 최신 완성봉=%s, 소스=%s, upsert=%d봉, ATR=%.4f",
-            symbol, candle_dt.isoformat(), _data_source, len(values_list),
+            "✅ [fetch_market_data] 완료 — symbol=%s, 최신 완성봉=%s, upsert=%d봉, ATR=%.4f",
+            symbol, candle_dt.isoformat(), len(values_list),
             float(_last_atr) if _last_atr else float("nan"),
         )
         return {"status": "ok", "symbol": symbol, "timestamp": candle_dt.isoformat()}
@@ -2203,18 +2137,23 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 logger.info("⏸️ [동결 게이트] PAUSED 상태 + 무포지션 — 이번 트리거 종료")
                 return {"status": "system_paused", "symbol": symbol}
 
-            # 4. 🛡️ [손절 방패 (우선순위 1위)] 리스크 관리 작동 검사
-            if current_position == "SHORT" and entry_price:
-                # 숏 포지션 수익률: 가격이 하락해야 수익 (+)
-                price_return = (entry_price - current_close) / entry_price
+            # 4. 🛡️ 보유 포지션 보호 가드 — 숏/롱 공통 (방향은 부호와 청산 사이드만 다름)
+            if current_position in ("SHORT", "LONG") and entry_price:
+                _is_short = current_position == "SHORT"
+                _pos_ko = "숏" if _is_short else "롱"
+                _exit_side = "BUY" if _is_short else "SELL"  # 숏 청산은 환매수(BUY), 롱 청산은 SELL
+                # 숏은 가격 하락, 롱은 가격 상승이 수익 (+)
+                price_return = (
+                    (entry_price - current_close) if _is_short else (current_close - entry_price)
+                ) / entry_price
+
+                # ── [손절 방패 (우선순위 1위)] ─────────────────────────────────────
                 if price_return <= STOP_LOSS_THRESHOLD:
                     logger.warning(f"🚨 [손절 방패 가동] 평단가: {entry_price} -> 현재가: {current_close} ({price_return*100:.2f}%)")
-                    
-                    # [동적 수량 계산 - 손절 청산]
-                    # API에서 받은 실제 포지션 절대 수량(pos_contracts)으로 환매수(BUY).
-                    # 구형 DB last_trade.amount 참조를 완전히 대체.
+
+                    # 청산 수량: API에서 받은 실제 포지션 절대 수량(pos_contracts)
                     calculated_amount = pos_contracts
-                    
+
                     # 방어적 검증 (Short-circuit): 최소 주문 수량 미만 검사
                     if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
                         logger.warning(
@@ -2227,7 +2166,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     sl_result: OrderResult = _execute_order_pipeline(
                         exchange=exchange,
                         symbol=symbol,
-                        side="BUY",  # 숏 포지션 청산은 BUY
+                        side=_exit_side,
                         amount=calculated_amount,
                         trigger_type="STOP_LOSS_SHIELD",
                         fallback_price=current_close,
@@ -2241,7 +2180,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     _run_async_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
-                        side="BUY",
+                        side=_exit_side,
                         price=sl_result["filled_price"],
                         amount=sl_record_amount,
                         status=sl_result["status"],
@@ -2256,69 +2195,17 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
 
                     return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
 
-            elif current_position == "LONG" and entry_price:
-                # 롱 포지션 수익률: 가격이 상승해야 수익 (+)
-                price_return = (current_close - entry_price) / entry_price
-                if price_return <= STOP_LOSS_THRESHOLD:
-                    logger.warning(f"🚨 [손절 방패 가동] 평단가: {entry_price} -> 현재가: {current_close} ({price_return*100:.2f}%)")
-                    
-                    calculated_amount = pos_contracts
-                    
-                    # 방어적 검증 (Short-circuit): 최소 주문 수량 미만 검사
-                    if calculated_amount <= Decimal("0") or calculated_amount < MIN_ORDER_BTC:
-                        logger.warning(
-                            f"⏸️  [손절 방패] 계산된 청산 수량이 부족하여 주문 생략: "
-                            f"계산된 수량={calculated_amount}, 최소 필요={MIN_ORDER_BTC}"
-                        )
-                        return {"status": "insufficient_calculated_amount"}
-
-                    # 🚀 프로덕션 등급 주문 집행 파이프라인 호출 (손절 방패)
-                    sl_result: OrderResult = _execute_order_pipeline(
-                        exchange=exchange,
-                        symbol=symbol,
-                        side="SELL",  # 롱 포지션 청산은 SELL
-                        amount=calculated_amount,
-                        trigger_type="STOP_LOSS_SHIELD",
-                        fallback_price=current_close,
-                        confidence=1.0,
-                        usdt_balance=usdt_balance,
-                    )
-
-                    # 이력 저장
-                    sl_record_amount = sl_result["filled_amount"] if sl_result["filled_amount"] > Decimal("0") else calculated_amount
-                    _run_async_safe(_async_save_trade_history(
-                        timestamp=datetime.now(timezone.utc),
-                        symbol=symbol,
-                        side="SELL",
-                        price=sl_result["filled_price"],
-                        amount=sl_record_amount,
-                        status=sl_result["status"],
-                    ))
-                    logger.info(
-                        "🗄️ [STOP_LOSS_SHIELD] DB 이력 저장 완료 (스레드 격리 비동기): status=%s, order_id=%s",
-                        sl_result["status"], sl_result["order_id"]
-                    )
-
-                    # 포지션 종료 — Peak ROI/불타기 카운터 잔류 상태 정리
-                    _reset_position_state(symbol)
-
-                    return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
-
-            # 4-1. ⏱️ [v9.2] 이중 리스크 가드 — 타임아웃 가드 + 트레일링 스탑 가드 (우선순위 2위)
-            # ═══════════════════════════════════════════════════════════════════════
-            # [Failsafe 순서]
-            #   Guard-A (최우선): 타임아웃 EXIT — 4시간 횡보 시 자금 회전을 위한 시장가 청산
-            #   Guard-B        : 트레일링 스탑 — Peak ROI +15% 터치 후 5% 반납 시 익절 잠금
-            #   Guard-C        : 하드 TP/SL EXIT — 기존 고정 임계치 강제 청산 (하위 호환 유지)
-            # ───────────────────────────────────────────────────────────────────────
-            if current_position == "SHORT" and entry_price:
-                # 숏 포지션 수익률 (진입가 - 현재가) / 진입가
-                price_return = (entry_price - current_close) / entry_price
+                # 4-1. ⏱️ [v9.2] 이중 리스크 가드 — 타임아웃 가드 + 트레일링 스탑 가드 (우선순위 2위)
+                # ═══════════════════════════════════════════════════════════════════
+                # [Failsafe 순서]
+                #   Guard-A (최우선): 타임아웃 EXIT — 4시간 횡보 시 자금 회전을 위한 시장가 청산
+                #   Guard-B        : 트레일링 스탑 — Peak ROI +15% 터치 후 5% 반납 시 익절 잠금
+                #   Guard-C        : 하드 TP/SL EXIT — 기존 고정 임계치 강제 청산 (하위 호환 유지)
+                # ───────────────────────────────────────────────────────────────────
                 now_utc_check = datetime.now(timezone.utc)
 
                 # 진입 시각: API updateTime 필드에서 추출하여 보유 기간 산출.
                 # _api_pos_raw['updateTime'] — 바이낸스 포지션 마지막 업데이트 밀리초 타임스탬프.
-                # 구형 DB last_trade.timestamp 참조를 완전히 대체.
                 entry_ts: datetime | None = None
                 try:
                     _update_time_ms = int(_api_pos_raw.get("updateTime", 0) or 0)
@@ -2383,27 +2270,26 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 # ── [Guard-C] 하드 TP / 하드 SL (기존 로직 하위 호환 유지) ───────
                 elif price_return >= HARD_TP_THRESHOLD:
                     _hard_trigger = "HARD_TP_EXIT"
-                    _hard_reason  = f"숏 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
+                    _hard_reason  = f"{_pos_ko} 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
                 elif price_return <= HARD_SL_THRESHOLD:
                     _hard_trigger = "HARD_SL_EXIT"
-                    _hard_reason  = f"숏 수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
+                    _hard_reason  = f"{_pos_ko} 수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
 
                 if _hard_trigger:
                     logger.warning(
-                        "🔔 [%s] 숏 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
-                        _hard_trigger, _hard_reason, entry_price, current_close, minutes_held,
+                        "🔔 [%s] %s 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
+                        _hard_trigger, _pos_ko, _hard_reason, entry_price, current_close, minutes_held,
                     )
                     # 청산 수량: API에서 받은 포지션 절대 수량(pos_contracts) 사용.
-                    # 구형 DB last_trade.amount 참조를 완전히 대체.
                     _hard_amount = pos_contracts
                     if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
-                        logger.warning("[%s] 숏 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
+                        logger.warning("[%s] %s 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _pos_ko, _hard_amount)
                         return {"status": "insufficient_amount_for_hard_exit"}
 
                     _hard_result: OrderResult = _execute_order_pipeline(
                         exchange=exchange,
                         symbol=symbol,
-                        side="BUY",  # 숏 청산 (환매수)
+                        side=_exit_side,
                         amount=_hard_amount,
                         trigger_type=_hard_trigger,
                         fallback_price=current_close,
@@ -2419,7 +2305,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     _run_async_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
-                        side="BUY",
+                        side=_exit_side,
                         price=_hard_result["filled_price"],
                         amount=_hard_rec_amount,
                         status=_hard_result["status"],
@@ -2461,155 +2347,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     else:
                         # Guard-C: 하드 TP/SL 기존 포맷 유지
                         notifier.send_message(
-                            f"🔔 <b>[QuantFlow] {_hard_trigger} (Short Cover)</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
-                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
-                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
-                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
-                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━"
-                        )
-                    return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
-
-            elif current_position == "LONG" and entry_price:
-                # 롱 포지션 수익률 (현재가 - 진입가) / 진입가
-                price_return = (current_close - entry_price) / entry_price
-                now_utc_check = datetime.now(timezone.utc)
-
-                entry_ts: datetime | None = None
-                try:
-                    _update_time_ms = int(_api_pos_raw.get("updateTime", 0) or 0)
-                    if _update_time_ms > 0:
-                        entry_ts = datetime.fromtimestamp(
-                            _update_time_ms / 1000.0, tz=timezone.utc
-                        )
-                except Exception as _ts_exc:
-                    logger.warning("⚠️ [포지션 진입 시각] updateTime 파싱 실패: %s", _ts_exc)
-
-                if entry_ts is not None:
-                    minutes_held = (now_utc_check - entry_ts).total_seconds() / 60.0
-                else:
-                    minutes_held = 0.0
-                    logger.warning(
-                        "⚠️ [포지션 보유 시간] updateTime 없음 → 타임아웃 가드 비활성화 (이번 턴 스킵)"
-                    )
-
-                # ── [Guard-B] Peak ROI 추적 레지스터 업데이트 ─────────────────────
-                _reg_key = _normalize_symbol(symbol)
-                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
-                if price_return > _current_peak:
-                    _peak_roi_register[_reg_key] = price_return
-                    logger.info(
-                        "📈 [TRAILING_STOP] Peak ROI 신고점 갱신: symbol=%s (key=%s), peak=%.2f%%, current=%.2f%%",
-                        symbol, _reg_key, float(price_return) * 100, float(price_return) * 100,
-                    )
-                _current_peak = _peak_roi_register.get(_reg_key, Decimal("0"))
-
-                _hard_trigger: str | None = None
-                _hard_reason: str = ""
-
-                # ── [Guard-A] 타임아웃 EXIT (최우선) ─────────────────────────────
-                if entry_ts is not None and minutes_held >= MAX_POSITION_MINUTES:
-                    _hard_trigger = "TIMEOUT_EXIT"
-                    _hard_reason  = (
-                        f"장기 횡보 타임아웃 — "
-                        f"보유 {minutes_held:.0f}분 → 상한 {MAX_POSITION_MINUTES}분 초과"
-                    )
-
-                # ── [Guard-B] 트레일링 스탑 (타임아웃 미발동 시 검사) ────────────
-                elif (
-                    _current_peak >= TRAILING_STOP_ACTIVATION_ROI
-                    and (_current_peak - price_return) >= TRAILING_STOP_DRAWDOWN
-                ):
-                    _hard_trigger = "TRAILING_STOP_EXIT"
-                    _hard_reason  = (
-                        f"익절 보존 가드 발동 — "
-                        f"Peak ROI {float(_current_peak)*100:+.2f}% 달성 후 "
-                        f"현재 {float(price_return)*100:+.2f}%로 "
-                        f"{float(_current_peak - price_return)*100:.2f}% 반납"
-                    )
-
-                # ── [Guard-C] 하드 TP / 하드 SL ───────
-                elif price_return >= HARD_TP_THRESHOLD:
-                    _hard_trigger = "HARD_TP_EXIT"
-                    _hard_reason  = f"롱 수익률 {price_return*100:+.2f}% ≥ +{float(HARD_TP_THRESHOLD)*100:.1f}% 하드 익절"
-                elif price_return <= HARD_SL_THRESHOLD:
-                    _hard_trigger = "HARD_SL_EXIT"
-                    _hard_reason  = f"롱 수익률 {price_return*100:+.2f}% ≤ {float(HARD_SL_THRESHOLD)*100:.1f}% 하드 손절"
-
-                if _hard_trigger:
-                    logger.warning(
-                        "🔔 [%s] 롱 강제 청산 발동: %s (평단=$%s, 현재=$%s, 보유=%.0f분)",
-                        _hard_trigger, _hard_reason, entry_price, current_close, minutes_held,
-                    )
-                    _hard_amount = pos_contracts
-                    if _hard_amount <= Decimal("0") or _hard_amount < MIN_ORDER_BTC:
-                        logger.warning("[%s] 롱 청산 수량 부족 → 청산 스킵: %s", _hard_trigger, _hard_amount)
-                        return {"status": "insufficient_amount_for_hard_exit"}
-
-                    _hard_result: OrderResult = _execute_order_pipeline(
-                        exchange=exchange,
-                        symbol=symbol,
-                        side="SELL",  # 롱 청산은 SELL
-                        amount=_hard_amount,
-                        trigger_type=_hard_trigger,
-                        fallback_price=current_close,
-                        confidence=1.0,
-                        usdt_balance=usdt_balance,
-                    )
-                    _hard_rec_amount = (
-                        _hard_result["filled_amount"]
-                        if _hard_result["filled_amount"] > Decimal("0")
-                        else _hard_amount
-                    )
-                    # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
-                    _run_async_safe(_async_save_trade_history(
-                        timestamp=datetime.now(timezone.utc),
-                        symbol=symbol,
-                        side="SELL",
-                        price=_hard_result["filled_price"],
-                        amount=_hard_rec_amount,
-                        status=_hard_result["status"],
-                    ))
-
-                    # ── 청산 완료 — Peak ROI/불타기 카운터 잔류 상태 일괄 정리 ──
-                    _reset_position_state(symbol)
-                    logger.info(
-                        "🧹 [%s] 포지션 파생 상태 정리 완료 (symbol=%s, key=%s)",
-                        _hard_trigger, symbol, _normalize_symbol(symbol),
-                    )
-
-                    # ── 가드별 차별화 텔레그램 알림 발송 ─────────────────────────
-                    if _hard_trigger == "TIMEOUT_EXIT":
-                        notifier.send_message(
-                            f"⏱️ <b>[TIMEOUT_EXIT] 장기 횡보로 인한 타임아웃 청산 완료</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
-                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
-                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
-                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
-                            f"• <b>수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
-                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━"
-                        )
-                    elif _hard_trigger == "TRAILING_STOP_EXIT":
-                        notifier.send_message(
-                            f"📈 <b>[TRAILING_STOP_EXIT] 익절 보존 가드 발동! 수익 잠금 완료</b>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━\n"
-                            f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
-                            f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
-                            f"• <b>청산가:</b> <code>${float(_hard_result['filled_price']):,.2f}</code>\n"
-                            f"• <b>수량:</b> <code>{float(_hard_rec_amount):.4f} BTC</code>\n"
-                            f"• <b>최고 수익률(Peak):</b> <code>{float(_current_peak)*100:+.2f}%</code>\n"
-                            f"• <b>청산 시 수익률:</b> <code>{float(price_return)*100:+.2f}%</code>\n"
-                            f"• <b>상태:</b> <code>{_hard_result['status']}</code>\n"
-                            f"━━━━━━━━━━━━━━━━━━━━"
-                        )
-                    else:
-                        # Guard-C: 하드 TP/SL 기존 포맷 유지
-                        notifier.send_message(
-                            f"🔔 <b>[QuantFlow] {_hard_trigger} (Long Exit)</b>\n"
+                            f"🔔 <b>[QuantFlow] {_hard_trigger} ({'Short Cover' if _is_short else 'Long Exit'})</b>\n"
                             f"━━━━━━━━━━━━━━━━━━━━\n"
                             f"• <b>사유:</b> <code>{_hard_reason}</code>\n"
                             f"• <b>평단가:</b> <code>${float(entry_price):,.2f}</code>\n"
@@ -2648,54 +2386,41 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
             if _regime_df is not None:
                 logger.debug("⚡ [REGIME] Redis 캐시 HIT — compute_all_features 중복 계산 생략")
             else:
-                # 캐시 미스: WebSocket 큐 → DB 순서로 폴백
+                # 캐시 미스: DB 기록으로 폴백
                 try:
-                    if _ohlcv_stream is not None and _ohlcv_stream.is_alive(symbol):
-                        _regime_df = _ohlcv_stream.get_latest_df(symbol=symbol, min_candles=60)
-                        if _regime_df is not None:
-                            from worker.indicators import compute_all_features as _caf_regime
-                            _regime_df = _caf_regime(_regime_df)
-                            _set_cached_features(symbol, _regime_df)  # 다음 호출 대비 캐시
-                except Exception as _regime_df_exc:
-                    logger.warning("⚠️ [REGIME] WebSocket 큐 DataFrame 조회 실패 → DB 폴백: %s", _regime_df_exc)
+                    _fallback_rows = (
+                        session.query(MarketData)
+                        .filter(MarketData.symbol == symbol)
+                        .order_by(desc(MarketData.timestamp))
+                        .limit(500)
+                        .all()
+                    )
+                    if len(_fallback_rows) >= 30:
+                        _fallback_rows.reverse()  # oldest → newest
+                        _df_fallback = pd.DataFrame([
+                            {
+                                "timestamp_ms": int(
+                                    _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
+                                    if _r.timestamp.tzinfo else
+                                    _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
+                                ),
+                                "open":   float(_r.open),
+                                "high":   float(_r.high),
+                                "low":    float(_r.low),
+                                "close":  float(_r.close),
+                                "volume": float(_r.volume),
+                            }
+                            for _r in _fallback_rows
+                        ])
+                        _df_fallback = _df_fallback.sort_values(
+                            "timestamp_ms", ascending=True
+                        ).reset_index(drop=True)
+                        from worker.indicators import compute_all_features as _caf_fallback
+                        _regime_df = _caf_fallback(_df_fallback)
+                        _set_cached_features(symbol, _regime_df)  # 다음 호출 대비 캐시
+                except Exception as _fb_exc:
+                    logger.warning("⚠️ [REGIME] DB 폴백 DataFrame 구성 실패: %s", _fb_exc)
                     _regime_df = None
-
-                # WebSocket 큐 미성숙 또는 실패 시 DB 기록으로 폴백
-                if _regime_df is None:
-                    try:
-                        _fallback_rows = (
-                            session.query(MarketData)
-                            .filter(MarketData.symbol == symbol)
-                            .order_by(desc(MarketData.timestamp))
-                            .limit(500)
-                            .all()
-                        )
-                        if len(_fallback_rows) >= 30:
-                            _fallback_rows.reverse()  # oldest → newest
-                            _df_fallback = pd.DataFrame([
-                                {
-                                    "timestamp_ms": int(
-                                        _r.timestamp.astimezone(timezone.utc).timestamp() * 1000
-                                        if _r.timestamp.tzinfo else
-                                        _r.timestamp.replace(tzinfo=timezone.utc).timestamp() * 1000
-                                    ),
-                                    "open":   float(_r.open),
-                                    "high":   float(_r.high),
-                                    "low":    float(_r.low),
-                                    "close":  float(_r.close),
-                                    "volume": float(_r.volume),
-                                }
-                                for _r in _fallback_rows
-                            ])
-                            _df_fallback = _df_fallback.sort_values(
-                                "timestamp_ms", ascending=True
-                            ).reset_index(drop=True)
-                            from worker.indicators import compute_all_features as _caf_fallback
-                            _regime_df = _caf_fallback(_df_fallback)
-                            _set_cached_features(symbol, _regime_df)  # 다음 호출 대비 캐시
-                    except Exception as _fb_exc:
-                        logger.warning("⚠️ [REGIME] DB 폴백 DataFrame 구성 실패: %s", _fb_exc)
-                        _regime_df = None
 
             # 국면 판독 실행
             _regime: str = "FLAT_HOLD"
@@ -3152,11 +2877,6 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     _ORDER_DEDUP_LOCK_TTL_SEC, _unlock_exc,
                 )
 
-
-# ⏱️ NTP 시간 동기화 및 스켈레톤 함수 유지
-@celery_app.task(name="worker.tasks.check_time_sync_task", queue="default")
-def check_time_sync_task():
-    return {"ntp_drift_ms": round(check_ntp_drift(), 1)}
 
 
 

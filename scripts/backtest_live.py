@@ -1,7 +1,6 @@
 """
 scripts/backtest_live.py — 라이브 전략(analyze_and_trade) 충실 재현 백테스터
 
-기존 scripts/backtest.py는 단순 숏 전용 BB+RSI 전략이라 라이브 엔진과 다르다.
 이 백테스터는 worker/tasks.py::analyze_and_trade 의 의사결정 우선순위를 그대로 옮겨
 LONG/SHORT 양방향 + 소프트SL + 하드TP/SL + 타임아웃 + 트레일링 + 피라미딩 + 국면판독을
 1분봉 단위로 시뮬레이션한다.

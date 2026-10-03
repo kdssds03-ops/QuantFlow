@@ -87,7 +87,7 @@ docker compose logs -f worker          # TREND 신호·매매 로그 관찰
 - 거래소에서 **One-Way 포지션 모드** + **레버리지 1~3x** 설정(봇은 안 건드림).
 - TREND은 4h봉 ~62개(≈10일 1m) 필요(백테스트 충실엔 ~43일). 부족하면 백필:
   - 포트폴리오(메이저4): `docker compose run --rm --entrypoint python worker scripts/backfill_symbol_1m.py "BTC/USDT,ETH/USDT,SOL/USDT,BNB/USDT" 45`
-  - 단일 BTC: `python scripts/backfill_db.py`
+  - 단일 BTC: `docker compose run --rm --entrypoint python worker scripts/backfill_symbol_1m.py "BTC/USDT" 45`
 
 ## 8. 운영 메모
 - **자동 재시작**: `restart: unless-stopped` 설정돼 있어 인스턴스 재부팅 시 자동 복구.

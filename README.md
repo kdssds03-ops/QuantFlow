@@ -1,87 +1,124 @@
-# 📈 QuantFlow: Hybrid ML Trading & Real-time Orchestration System
+# QuantFlow
 
-> **High-Performance Distributed Algorithmic Trading Infrastructure with LightGBM & Celery**
+바이낸스 USDT 선물에서 24시간 돌아가는 암호화폐 자동매매 봇입니다.
+Celery 워커가 1분마다 캔들을 수집하고 신호를 확인해 주문을 내며, 상태와 결과는 텔레그램으로 받습니다.
 
-QuantFlow는 실시간 금융 시계열 데이터 파이프라인 수집, 머신러닝(LightGBM) 기반의 하이브리드 의사결정, 그리고 금융권 프로덕션 규격의 주문 예외 처리 가드가 결합된 **상용 등급(Production-ready) 자동매매 인프라 시스템**입니다.
+개인 프로젝트이고 실제 자금으로 운용 중입니다. 수익을 보장하지 않습니다.
 
----
+## 전략
 
-## 🛠️ Tech Stacks & Architecture
+현재 쓰는 전략은 4시간봉 EMA(30/60) 교차 추세추종 하나입니다. 빠른 선이 느린 선 위에 있으면 롱, 아래면 숏이고, 신호가 뒤집히면 포지션을 반대로 바꿉니다(스톱 앤 리버스).
 
-- **Backend Framework**: FastAPI (Asynchronous Concurrency)
-- **Distributed Task Queue**: Celery (Prefork Worker Pool) & Redis (Message Broker)
-- **Database**: PostgreSQL (Timescale-ready Time Series Layout) & Alembic (Schema Data Shield)
-- **Machine Learning**: LightGBM, Scikit-Learn, Pandas, Numpy (In-Memory Vectorized Pipelines)
-- **Exchange Interface**: CCXT Premium Connector (Binance / Bybit Sandbox Environment)
-- **Monitoring**: Telegram Watchtower API (Premium HTML Formatted Report)
+처음에는 1분봉 볼린저+RSI 평균회귀와 LightGBM 분류 모델로 시작했습니다. 라이브 로직을 그대로 옮긴 백테스트를 만들어 돌려 보니 둘 다 수수료를 빼면 엣지가 없어서 교체했습니다. 코드는 남아 있고 `PREDICTOR_TYPE`으로 고를 수 있지만 쓰지 않습니다.
 
----
+검증구간(OOS, 438일) 기준 수치입니다. 백테스트는 실전보다 낙관적이니 이보다 낮게 봐야 합니다.
 
-## 💡 Key Architectural Safeguards (핵심 가드 아키텍처)
+| 구성 | 결과 |
+|---|---|
+| BTC 단일, `RISK_FACTOR=0.50` | 연 +13.5%, MDD -18.7% |
+| 메이저 4종 분산 + 변동성 타게팅 | Sharpe 0.78 → 1.10 (BTC 단일 대비) |
 
-### 1. 🛡️ Redis 기반 부팅 멱등성 가드 (Idempotency Shield)
+파라미터를 바꿀 때는 학습/검증 구간을 나누고, 한 값에서만 좋은 결과는 과최적으로 보고 버립니다. 피라미딩과 단일 심볼 변동성 타게팅은 이 기준에서 탈락해 꺼 두었습니다.
 
-Celery `prefork` 실행 모델의 프로세스 분기 및 모듈 재평가로 인한 텔레그램 알림 도배 장해를 방지하기 위해, Redis `SET NX`(24h TTL) 플래그로 인프라 부팅 시 **단 1회의 알림만 발송**되도록 통제합니다.
+## 구성
 
-### ⛓️ 2. 단독 책임 체인 의존성 인프라 (Dependency Chain Lifecycle)
+```
+postgres          1분봉, 체결 이력
+redis             Celery 브로커, 락, 상태 플래그
+api               FastAPI. 기동 시 Alembic 마이그레이션 수행, /health 제공
+worker            캔들 수집 + 신호 분석 + 주문
+listener-worker   텔레그램 명령 전용 (매매 워커와 큐 분리)
+beat              스케줄러
+```
 
-다중 컨테이너 구동 시 발생하는 마이그레이션 레이스 컨디션을 원천 차단합니다. `api` 서비스가 `Alembic` 증분 마이그레이션을 안전하게 완수하고 `GET /health` 생존 심장박동을 증명하기 전까지 `worker`와 `beat` 컨테이너를 대기실에 묶어두는 안정적 오케스트레이션을 보장합니다.
+`worker`와 `beat`는 `api`의 헬스체크가 통과한 뒤에 뜹니다. 마이그레이션이 끝나기 전에 워커가 DB를 건드리는 일을 막기 위해서입니다.
 
-### 🔄 3. 순환 참조 진압 및 지연 임포트 (Lazy Import Pattern)
+주요 코드:
 
-앱 초기화(Initialization) 시점에 발생할 수 있는 모듈 간의 순환 의존성 분기를 차단하기 위해 글로벌 임포트를 전면 제거하고, API 라우터 함수 내부에 **Lazy Import 가드**를 주입하여 프로세스 무결성을 확보했습니다.
+- `worker/tasks.py` — 수집, 매매 판단, 주문 집행, 텔레그램 명령, 일일 리포트
+- `worker/predictor.py` — 신호 생성 (TREND / RULE / ML)
+- `worker/portfolio.py` — 멀티심볼 사이징 (리스크 패리티 + 포트 변동성 타게팅)
+- `core/` — 설정, DB, 거래소(ccxt) 연결, 텔레그램 알림
+- `scripts/` — 백테스트, 검증, 백필, 사전점검
 
-### 🛑 4. 무적의 주문 집행 파이프라인 (Order Execution Pipeline)
+## 리스크 관리
 
-실전 트레이딩에서 발생하는 돌발 변수를 통제하기 위해 4단계 예외 처리 레이어를 탑재했습니다:
+- **일일 손실 서킷브레이커**: 당일 손실이 `MAX_DAILY_LOSS_PCT`에 닿으면 신규 진입을 멈추고 다음 거래일(KST)에 자동 재개합니다. 보유 포지션의 손절은 계속 동작합니다.
+- **자본 방화벽**: 한 번의 진입이 가용 마진의 `MAX_CAPITAL_PER_SYMBOL_PCT`를 넘으면 주문을 거부합니다. `RISK_FACTOR`보다 작게 두면 모든 주문이 거부되니 주의하세요.
+- **재난 손절**: 추세 전환 신호와 별개로 -12% / -15%에서 강제 청산합니다.
+- **중복 주문 방지**: 심볼별 Redis 락으로 같은 심볼의 동시 실행을 막습니다.
+- **주문 집행**: 네트워크 오류는 지수 백오프로 3회 재시도, 잔고 부족·잘못된 주문은 즉시 거부, 5초 안에 체결되지 않은 잔량은 취소하고 실제 체결량만 기록합니다.
+- **포트폴리오 모드 총노출 상한**: `PORTFOLIO_MAX_GROSS`(기본 1.5배)를 넘지 않습니다.
 
-- **Network Timeout**: `tenacity` 라이브러리를 활용한 3단계 지수 백오프(Exponential Backoff: 1s -> 2s -> 4s) 재시도 가드
-- **Insufficient Funds / Invalid Order**: 즉시 `REJECTED` 처리 후 단락(Short-circuit) 및 🚨 긴급 텔레그램 경고 발송
-- **Unfilled Order Lock**: 주문 전송 후 최대 5초간 1초 주기로 체결 상태 폴링 스캔, 미체결 잔량은 `cancel_order()`로 강제 취소 후 실제 체결량 기준 DB 칼정산
+## 텔레그램
 
-### 🧠 5. 인메모리 피처 파이프라인 & ML 상식 검증 가드
+| 명령 | 동작 |
+|---|---|
+| `/status` | 잔고, 포지션(평단가·경과 시간), 24시간 손익, 현재가·지표 요약 |
+| `/pause` | 신규 진입 중단 (보유 포지션 보호는 유지) |
+| `/resume` | 재개 |
 
-- **In-Memory Logic**: DB 스키마 추가에 따른 I/O 병목 및 데이터 유실 위험을 방지하기 위해 최근 200봉 데이터를 판다스로 빌드하여 메모리 단에서 12종 다중 지표(EMA, MACD, RSI, Stochastic, BB)를 벡터 연산합니다.
-- **Heuristic Guard**: LightGBM 모델의 추론 신뢰도(Confidence Threshold)가 65% 미만이거나, 과열/과매도 구간에서 모순되는 시그널(RSI 과열 시 BUY 발생 등)을 출력할 경우 의사결정을 강제로 `HOLD`로 스위칭하며, 예외 발생 시 규칙 기반 모델(`RuleBasedPredictor`)로 안전하게 폴백(Fallback)됩니다.
+주문 체결, 손절, 서킷브레이커 발동 시 알림이 오고, 매일 23:59(KST)에 일일 결산이 옵니다. 12시간마다 도는 헬스체크는 이상이 있을 때만 알립니다.
 
-### 🔤 6. 바이낸스-CCXT 포지션 심볼 정규화 가드 (Symbol Normalization Shield) [v9.3]
-
-바이낸스 선물 API(`positionRisk`)가 반환하는 하이픈/슬래시 없는 원시 심볼(예: `BTCUSDT`)과 로컬 DB/CCXT 등에서 사용하는 표준 심볼 포맷(예: `BTC/USDT`) 간의 불일치를 방지하기 위해 **심볼 정규화 엔진(`_normalize_symbol`)**을 탑재했습니다.
-- **KeyMismatch 원천 차단**: 실시간으로 최고 수익률을 추적하는 인메모리 Peak ROI 레지스터(`_peak_roi_register`) 및 트레일링 스탑(Trailing Stop) 작동 시 발생할 수 있는 KeyMismatch 누락을 완벽히 방지합니다.
-- **포지션 가드 무결성**: 어떠한 심볼 포맷의 입력이 들어오더라도 동일한 키값으로 매핑하여 트레일링 가드가 오작동하거나 누락되지 않도록 프로세스 무결성을 보장합니다.
-
----
-
-## 📱 Real-time Telegram Monitoring Control & Daily Reporting [v9.3]
-
-시스템은 실시간 매매 타점 포착, 주문 체결 정산 결과, 그리고 **매일 자정 지난 24시간 동안의 가중 평단가 기반 승률(Win Rate) 및 PnL**을 정밀 집계하여 프리미엄 HTML 리포트 형태로 스마트폰 관제탑에 브리핑합니다.
-
-특히 **v9.3 업데이트**를 통해 실시간 상태 모니터링과 일일 결산 리포트의 신뢰성을 극적으로 개선했습니다:
-
-### 1. 🔍 다중 레이어 포지션 크로스 밸리데이션 (Cross-Validation)
-- **CCXT & DB 이중 검증**: 일일 결산 리포트 생성 시, 로컬 DB 상태에만 의존하지 않고 CCXT API `fetch_positions`를 통해 바이낸스 선물 계정의 실제 활성 포지션을 실시간으로 직접 대조 검증합니다.
-- **SHORT(숏) 포지션 완벽 지원**: 기존 롱(LONG) 중심 정산 아키텍처를 전면 개편하여, 숏 포지션이 유지 중일 때 FLAT으로 잘못 표기되던 집계 누락을 완벽히 해결했습니다.
-
-### 2. 🧮 정밀화된 PnL 연산 및 미실현 손익(Unrealized PnL) 추적
-- **방향성별 실현 PnL 공식 분리**: 숏 포지션 청산 시 실현 PnL을 `(평균매도가 - 매수단가) * 수량`으로 정확히 계산하도록 수식을 정교화했습니다.
-- **미실현 손익 실시간 반영**: 리포트 발행 시점 기준으로 바이낸스에 활성 포지션이 유지 중일 경우, 실시간 평가 손익(Unrealized PnL)을 리포트에 함께 표기하여 계좌 상태의 가시성을 극대화합니다.
-
-### ⏱️ 3. Telegram `/status` 브리핑 및 보유 시간(Duration) 정산 개선
-- active side(`BUY`/`SELL`)에 대응하는 정밀 트레이드 이력을 추적하여, 텔레그램 `/status` 호출 시 포지션 진입 시점과 경과 시간(`pos_duration_str`)이 누락 없이 실시간으로 계산 및 정산되도록 개선했습니다.
-
----
-
-## 💻 Installation & Quick Start
-
-본 프로젝트는 도커 오케스트레이션으로 100% 캡슐화되어 있어, 환경변수 설정 후 단 한 줄의 명령어로 클린 빌드가 가능합니다.
+## 실행
 
 ```bash
-# 1. 환경 변수 샘플 카피 및 설정
 cp .env.example .env
+```
 
-# 2. 인프라 전체 클린 리빌드 및 백그라운드 가동
+`.env`에 DB 비밀번호, 거래소 API 키, 텔레그램 토큰을 채운 뒤:
+
+```bash
 docker compose up -d --build
+```
 
-# 3. 실시간 분산 워커 파이프라인 로그 모니터링
+```bash
 docker compose logs -f worker
 ```
+
+TREND 전략은 4시간봉이 최소 62개(1분봉 약 10일) 있어야 신호를 내고, 백테스트와 같은 EMA 값을 얻으려면 약 43일치가 필요합니다. 처음 띄울 때는 백필부터 하세요.
+
+```bash
+docker compose run --rm --entrypoint python worker scripts/backfill_symbol_1m.py "BTC/USDT" 45
+```
+
+설정을 바꾼 뒤 반영하는 방법이 다릅니다.
+
+- `.env`를 바꿨으면 `docker compose up -d <서비스>` (`restart`는 env 파일을 다시 읽지 않습니다)
+- 코드만 바꿨으면 `docker compose restart <서비스>`
+
+## 주요 설정
+
+| 변수 | 현재값 | 설명 |
+|---|---|---|
+| `EXCHANGE_SANDBOX` | `true` | 테스트넷 여부. 실전 전 반드시 페이퍼로 검증 |
+| `PREDICTOR_TYPE` | `TREND` | `TREND` / `RULE` / `ML` |
+| `RISK_FACTOR` | `0.50` | 진입 시 가용 마진 비율 |
+| `MAX_DAILY_LOSS_PCT` | `0.05` | 서킷브레이커 기준 |
+| `MAX_CAPITAL_PER_SYMBOL_PCT` | `0.60` | 자본 방화벽 |
+| `PORTFOLIO_MODE` | `false` | 멀티심볼 분산 모드 |
+
+포트폴리오 모드를 켜려면 전 심볼을 백필하고 테스트넷에서 몇 주 돌려 본 뒤에 소액으로 시작하세요. 나머지 변수는 `.env.example`에 설명이 있습니다.
+
+## 실전 투입 전
+
+```bash
+python scripts/preflight.py
+```
+
+포지션 모드(One-Way), 레버리지, DB 데이터 신선도, API 키, 텔레그램 연결을 한 번에 점검합니다. 주문은 내지 않습니다.
+
+백테스트와 검증 스크립트:
+
+- `scripts/backtest_live.py` — 라이브 로직을 그대로 재현한 백테스트 (`--portfolio`로 멀티심볼)
+- `scripts/risk_factor_scenarios.py` — 사이징별 OOS 시나리오
+- `scripts/signal_research.py`, `scripts/regime_validation.py` — 신호·국면별 검증
+- `scripts/audit_trend_fidelity.py` — 라이브와 백테스트의 괴리 측정
+
+서버 배포는 [docs/DEPLOY_ORACLE.md](docs/DEPLOY_ORACLE.md)를 참고하세요.
+
+## 알려진 한계
+
+- 사이징은 진입할 때 한 번만 계산합니다. 매 봉 리밸런싱하는 백테스트보다 실측이 약간 나쁠 수 있습니다.
+- 신호는 DB의 1분봉으로 계산하므로 수집이 끊기면 신호도 멈춥니다. 데이터가 부족하면 진입하지 않습니다.
+- 가격 방향을 맞히는 모델이 아닙니다. 수익은 추세가 길게 이어질 때 나오고, 횡보장에서는 잦은 반전으로 손실이 납니다.

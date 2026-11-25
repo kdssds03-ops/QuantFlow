@@ -38,3 +38,12 @@ data/btc_1m_1year.csv
 
 # 백테스트 캐시 (재생성 가능)
 data/_basket_4h.json
+
+# Local trading tool installations
+/external/
+
+# 주식 나침반 백테스트 캐시 (재생성 가능)
+data/_kr_cache/
+data/kr_portfolio.json
+data/kr_portfolio.tmp
+

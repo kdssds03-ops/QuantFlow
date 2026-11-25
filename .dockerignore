@@ -8,3 +8,11 @@ venv
 .idea
 .vscode
 *.md
+
+# Local trading tool installations
+external/
+
+# 개인 보유 내역·캐시
+data/kr_portfolio.json
+data/kr_portfolio.tmp
+data/_kr_cache/

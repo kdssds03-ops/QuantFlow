@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>주식 나침반</title>
+<style>
+:root {
+  --bg: #f6f7f9; --card: #ffffff; --ink: #16181d; --muted: #6b7280; --line: #e5e7eb;
+  --green: #16a34a; --yellow: #d97706; --red: #dc2626; --grey: #9ca3af; --accent: #2563eb;
+  --up: #dc2626; --down: #2563eb; --on-accent: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0f1115; --card: #181b21; --ink: #e8eaee; --muted: #9aa1ad; --line: #2a2f38;
+          --green: #22c55e; --yellow: #f59e0b; --red: #f87171; --grey: #6b7280; --accent: #60a5fa;
+          --up: #f87171; --down: #60a5fa; --on-accent: #0f1115; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 20px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.sub { color: var(--muted); font-size: 13px; margin: 0 0 16px; }
+.search { position: relative; }
+.search input { width: 100%; padding: 12px 14px; font-size: 16px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--card); color: var(--ink); }
+.search input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.suggest { position: absolute; left: 0; right: 0; top: 100%; margin-top: 4px; background: var(--card);
+  border: 1px solid var(--line); border-radius: 10px; overflow: hidden; z-index: 5; }
+.suggest button { display: flex; justify-content: space-between; width: 100%; padding: 10px 14px; border: 0;
+  background: none; color: var(--ink); font: inherit; text-align: left; cursor: pointer; }
+.suggest button:hover, .suggest button:focus { background: var(--bg); }
+.suggest small { color: var(--muted); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-top: 14px; }
+.head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 14px; }
+.head h2 { margin: 0; font-size: 20px; }
+.price { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.meta { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
+.tally { display: flex; gap: 14px; margin-top: 10px; font-size: 14px; flex-wrap: wrap; }
+.dot { display: inline-block; width: 11px; height: 11px; border-radius: 50%; vertical-align: -1px; margin-right: 5px; }
+.dot.green { background: var(--green); } .dot.yellow { background: var(--yellow); }
+.dot.red { background: var(--red); } .dot.grey { background: var(--grey); }
+.light { display: grid; grid-template-columns: 16px 1fr; gap: 4px 10px; padding: 12px 0; border-top: 1px solid var(--line); }
+.light:first-child { border-top: 0; padding-top: 0; }
+.light .dot { margin-top: 6px; }
+.light b { font-size: 15px; }
+.light .tag { font-size: 12px; color: var(--muted); margin-left: 6px; }
+.light .val { grid-column: 2; font-variant-numeric: tabular-nums; }
+.light .rule { grid-column: 2; color: var(--muted); font-size: 12px; }
+.light .bt { color: var(--warn-ink); }
+:root { --warn-ink: #92400e; }
+@media (prefers-color-scheme: dark) { :root { --warn-ink: #fbbf24; } }
+h2.sec { font-size: 14px; margin: 0 0 10px; color: var(--muted); font-weight: 600; }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; font-size: 14px; }
+dt { color: var(--muted); } dd { margin: 0; font-variant-numeric: tabular-nums; }
+ul { margin: 0; padding-left: 18px; font-size: 14px; } li { margin: 3px 0; }
+li small { color: var(--muted); }
+svg { width: 100%; height: 160px; display: block; }
+.warn { background: color-mix(in srgb, var(--yellow) 12%, var(--card)); border-color: color-mix(in srgb, var(--yellow) 40%, var(--line));
+  font-size: 13px; }
+.err { color: var(--red); font-size: 13px; }
+.empty { color: var(--muted); text-align: center; padding: 40px 0; }
+.legend { font-size: 12px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 4px; }
+.legend span { white-space: nowrap; }
+.legend i { display: inline-block; width: 14px; height: 2px; vertical-align: middle; margin-right: 4px; }
+
+.tabs { display: flex; gap: 4px; margin: 0 0 14px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs button { border: 0; background: none; color: var(--muted); font: inherit; font-weight: 600; padding: 10px 12px;
+  border-bottom: 2px solid transparent; cursor: pointer; white-space: nowrap; }
+.tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+.form { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px 12px; margin-top: 12px; }
+.form label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); }
+input.num, .pf input { padding: 9px 10px; font: inherit; font-size: 16px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--card); color: var(--ink); font-variant-numeric: tabular-nums; width: 100%; }
+.btn { margin-top: 12px; padding: 10px 16px; border: 0; border-radius: 8px; background: var(--accent); color: var(--on-accent);
+  font: inherit; font-weight: 600; cursor: pointer; }
+.btn.ghost { background: none; color: var(--accent); border: 1px solid var(--line); }
+.big { font-size: 28px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.pf { width: 100%; border-collapse: collapse; font-size: 14px; }
+.pf th { text-align: left; color: var(--muted); font-weight: 600; font-size: 12px; padding: 6px 4px; }
+.pf td { padding: 4px; vertical-align: middle; }
+.pf td:first-child { min-width: 90px; }
+.pf input { min-width: 96px; }
+.xbtn { border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 18px; }
+.scroll { overflow-x: auto; }
+.tbl { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+.tbl th, .tbl td { padding: 7px 6px; border-top: 1px solid var(--line); text-align: right; white-space: nowrap; }
+.tbl th:first-child, .tbl td:first-child { text-align: left; }
+.tbl th { color: var(--muted); font-weight: 600; font-size: 12px; border-top: 0; }
+.alert { color: var(--red); font-size: 12.5px; }
+.note { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🧭 주식 나침반</h1>
+  <p class="sub">한국 주식 리스크·비중 관리 · 가격을 예측하지 않습니다</p>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="size" aria-selected="true">수량 계산</button>
+    <button role="tab" data-tab="pf" aria-selected="false">내 포트폴리오</button>
+    <button role="tab" data-tab="stock" aria-selected="false">종목 상태</button>
+  </nav>
+
+  <section id="tab-size">
+    <div class="card">
+      <h2 class="sec">산다면 몇 주까지? — 입력 조건에서의 최대 수량</h2>
+      <div class="search"><input id="size-q" type="search" placeholder="종목명 또는 코드" autocomplete="off" aria-label="종목 검색">
+        <div class="suggest" hidden></div></div>
+      <div class="form">
+        <label>계좌 총액(원)<input class="num" id="s-account" inputmode="numeric" placeholder="예: 30,000,000"></label>
+        <label>1회 감당 손실(계좌 %)<input class="num" id="s-risk" inputmode="decimal" value="1"></label>
+        <label>한 종목 최대 비중(%)<input class="num" id="s-maxpos" inputmode="decimal" value="20"></label>
+        <label>가용 현금(원, 선택)<input class="num" id="s-cash" inputmode="numeric"></label>
+        <label>진입가(선택, 기본 최근 종가)<input class="num" id="s-entry" inputmode="numeric"></label>
+        <label>손절가(선택, 기본 진입가−2×ATR)<input class="num" id="s-stop" inputmode="numeric"></label>
+      </div>
+      <p class="note">기본값(1%, 20%, 2×ATR)은 검증되지 않은 예시이니 바꿔 쓰세요. 금액은 이 서버에만 전달되고, 네이버에는 검색어·종목코드만 갑니다.</p>
+      <button class="btn" id="s-go">계산</button>
+    </div>
+    <div id="size-out"></div>
+  </section>
+
+  <section id="tab-pf" hidden>
+    <div class="card">
+      <h2 class="sec">보유 종목 (이 컴퓨터의 data/kr_portfolio.json 에 저장)</h2>
+      <div class="search"><input id="pf-q" type="search" placeholder="종목 추가: 이름 또는 코드" autocomplete="off" aria-label="보유 종목 추가">
+        <div class="suggest" hidden></div></div>
+      <div class="scroll"><table class="pf"><thead><tr><th>종목</th><th>수량</th><th>평균단가(선택)</th><th>손절가(선택)</th><th></th></tr></thead>
+        <tbody id="pf-rows"></tbody></table></div>
+      <div class="form"><label>현금(원)<input class="num" id="pf-cash" inputmode="numeric" value="0"></label></div>
+      <button class="btn" id="pf-save">저장하고 분석</button>
+    </div>
+    <div id="pf-out"></div>
+  </section>
+
+  <section id="tab-stock" hidden>
+    <div class="search"><input id="q" type="search" placeholder="종목명 또는 6자리 코드 (예: 삼성전자, 005930)" autocomplete="off" aria-label="종목 검색">
+      <div class="suggest" hidden></div></div>
+    <div id="out"><p class="empty">종목을 검색하세요. (신호등은 백테스트에서 예측력이 확인되지 않았습니다)</p></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmt = n => n == null ? "-" : Math.round(n).toLocaleString("ko-KR");
+const pct = (n, d = 1) => n == null ? "-" : n.toFixed(d) + "%";
+const numv = el => { const v = parseFloat(String(el.value).replace(/,/g, "")); return isNaN(v) ? null : v; };
+const LABEL = {green: "충족", yellow: "혼조", red: "미충족", grey: "자료 부족"};
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+                set(k, v) { try { localStorage.setItem(k, v); } catch {} } };
+
+async function api(url, opts) {
+  const r = await fetch(url, opts);
+  const d = await r.json();
+  if (!r.ok) throw new Error(typeof d.detail === "string" ? d.detail : "입력값을 확인하세요.");
+  return d;
+}
+
+// 종목 검색 자동완성 (여러 곳에서 재사용)
+function picker(input, onPick) {
+  const box = input.parentElement.querySelector(".suggest");
+  let timer;
+  input.addEventListener("input", () => {
+    clearTimeout(timer);
+    const v = input.value.trim();
+    if (!v) { box.hidden = true; return; }
+    timer = setTimeout(async () => {
+      try {
+        const items = await api("/api/search?q=" + encodeURIComponent(v));
+        box.innerHTML = items.map(i => `<button data-code="${esc(i.code)}" data-name="${esc(i.name)}">${esc(i.name)} <small>${esc(i.code)} ${esc(i.market)}</small></button>`).join("");
+        box.hidden = !items.length;
+      } catch { box.hidden = true; }
+    }, 200);
+  });
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter" && !e.isComposing) { const b = box.querySelector("button"); if (b) b.click(); }
+  });
+  box.addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    box.hidden = true; onPick(b.dataset.code, b.dataset.name);
+  });
+  document.addEventListener("click", e => { if (!input.parentElement.contains(e.target)) box.hidden = true; });
+}
+
+// ── 탭 ──
+function showTab(name) {
+  for (const b of document.querySelectorAll(".tabs button")) b.setAttribute("aria-selected", b.dataset.tab === name);
+  for (const t of ["size", "pf", "stock"]) $("#tab-" + t).hidden = t !== name;
+  store.set("tab", name);
+  if (name === "pf" && !pfLoaded) loadPortfolio();
+}
+document.querySelector(".tabs").addEventListener("click", e => { const b = e.target.closest("button"); if (b) showTab(b.dataset.tab); });
+
+// ── 수량 계산 ──
+let sizeCode = null;
+for (const id of ["s-account", "s-risk", "s-maxpos"]) {
+  const v = store.get(id); if (v) $("#" + id).value = v;
+  $("#" + id).addEventListener("change", e => store.set(id, e.target.value));
+}
+picker($("#size-q"), (code, name) => { sizeCode = code; $("#size-q").value = name; $("#s-entry").value = ""; $("#s-stop").value = ""; calcSize(); });
+$("#s-go").addEventListener("click", calcSize);
+
+async function calcSize() {
+  const out = $("#size-out");
+  if (!sizeCode) { out.innerHTML = `<div class="card err">종목을 먼저 고르세요.</div>`; return; }
+  const account = numv($("#s-account"));
+  if (!account) { out.innerHTML = `<div class="card err">계좌 총액을 입력하세요.</div>`; return; }
+  out.innerHTML = '<p class="empty">계산 중…</p>';
+  try {
+    const d = await api("/api/size", { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({
+      code: sizeCode, account, risk_pct: numv($("#s-risk")) ?? 1, max_pos_pct: numv($("#s-maxpos")) ?? 20,
+      cash: numv($("#s-cash")), entry: numv($("#s-entry")), stop: numv($("#s-stop")) }) });
+    if (d.state === "error") { out.innerHTML = `<div class="card err">${esc(d.message)}</div>`; return; }
+    out.innerHTML = `
+    <div class="card">
+      <div class="head"><h2>${esc(d.name)}</h2><span class="meta">${esc(d.code)} · 최근 종가 ${fmt(d.last_close)}원 (${esc(d.last_date)}) · ATR14 ${fmt(d.atr)}원 (${pct(d.atr_pct)})</span></div>
+      <p class="meta">입력 조건에서의 최대 수량</p>
+      <div class="big">${fmt(d.shares)}주</div>
+      ${d.state === "zero" ? `<p class="err">${esc(d.message)}</p>` : ""}
+      <dl style="margin-top:12px">
+        <dt>매수 금액</dt><dd>${fmt(d.position_value)}원 (계좌의 ${pct(d.position_pct)})</dd>
+        <dt>진입가 / 손절가</dt><dd>${fmt(d.entry)} / ${fmt(d.stop)}원 (${pct(d.stop_pct)}, ${esc(d.stop_source)})</dd>
+        <dt>손절 시 손실</dt><dd>${fmt(d.loss_at_stop)}원 (계좌의 ${pct(d.loss_at_stop_pct, 2)})</dd>
+        <dt>하한가(−30%) 하루 손실</dt><dd>${fmt(d.loss_limit_down)}원 (계좌의 ${pct(d.loss_limit_down_pct, 2)})</dd>
+        <dt>수량을 묶은 조건</dt><dd>${esc(d.binding)} — ${Object.entries(d.caps).map(([k, v]) => `${esc(k)} ${fmt(v)}주`).join(" · ")}</dd>
+      </dl>
+      <p class="note">손절가에 정확히 팔린다는 보장은 없습니다. 갭 하락이면 손실이 더 커집니다. 하루 최대 하락은 하한가(−30%, 레버리지 ETF는 더 큼)이고, 연속 하한가나 거래정지가 이어지면 그보다 커질 수 있습니다. 수익을 예측한 값이 아닙니다.</p>
+    </div>`;
+  } catch (e) { out.innerHTML = `<div class="card err">${esc(e.message)}</div>`; }
+}
+
+// ── 포트폴리오 ──
+let pfLoaded = false, pf = { cash: 0, holdings: [] };
+picker($("#pf-q"), (code, name) => {
+  if (!pf.holdings.some(h => h.code === code)) pf.holdings.push({ code, name, shares: "" });
+  $("#pf-q").value = ""; drawRows();
+  const last = $("#pf-rows").lastElementChild; if (last) last.querySelector("input").focus();
+});
+function drawRows() {
+  $("#pf-rows").innerHTML = pf.holdings.map((h, i) => `<tr data-i="${i}">
+    <td>${esc(h.name || h.code)}<br><span class="note">${esc(h.code)}</span></td>
+    <td><input data-f="shares" inputmode="numeric" value="${esc(h.shares ?? "")}" aria-label="수량"></td>
+    <td><input data-f="avg" inputmode="numeric" value="${esc(h.avg ?? "")}" aria-label="평균단가"></td>
+    <td><input data-f="stop" inputmode="numeric" value="${esc(h.stop ?? "")}" aria-label="손절가"></td>
+    <td><button class="xbtn" data-del="${i}" aria-label="삭제">×</button></td></tr>`).join("")
+    || `<tr><td colspan="5" class="note">위 검색창으로 보유 종목을 추가하세요.</td></tr>`;
+}
+$("#pf-rows").addEventListener("input", e => {
+  const tr = e.target.closest("tr"); if (!tr || !e.target.dataset.f) return;
+  pf.holdings[+tr.dataset.i][e.target.dataset.f] = e.target.value.replace(/,/g, "");
+});
+$("#pf-rows").addEventListener("click", e => {
+  const b = e.target.closest("[data-del]"); if (!b) return;
+  pf.holdings.splice(+b.dataset.del, 1); drawRows();
+});
+async function loadPortfolio() {
+  pfLoaded = true;
+  try { pf = await api("/api/portfolio"); } catch {}
+  $("#pf-cash").value = pf.cash || 0; drawRows();
+  if (pf.holdings.length) analyze();
+}
+$("#pf-save").addEventListener("click", async () => {
+  pf.cash = $("#pf-cash").value.replace(/,/g, "") || 0;
+  try {
+    pf = await api("/api/portfolio", { method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(pf) });
+    drawRows(); analyze();
+  } catch (e) { $("#pf-out").innerHTML = `<div class="card err">${esc(e.message)}</div>`; }
+});
+
+async function analyze() {
+  const out = $("#pf-out");
+  out.innerHTML = '<p class="empty">분석 중…</p>';
+  let d;
+  try { d = await api("/api/portfolio/analysis"); } catch (e) { out.innerHTML = `<div class="card err">${esc(e.message)}</div>`; return; }
+  if (d.state !== "ok") { out.innerHTML = `<div class="card note">${esc(d.message || "보유 종목이 없습니다.")}</div>`; return; }
+  const names = Object.fromEntries(d.holdings.map(h => [h.code, h.name]));
+  pf.holdings.forEach(h => { if (names[h.code]) h.name = names[h.code]; });
+  drawRows();
+  const s = d.stats;
+  const alerts = d.holdings.filter(h => h.alerts.length || h.disclosures?.length);
+  const corrRows = s ? Object.keys(s.corr) : [];
+  out.innerHTML = `
+  <div class="card"><h2 class="sec">요약</h2><dl>
+    <dt>총 평가금액</dt><dd>${fmt(d.total)}원 (현금 ${pct(d.cash_pct)})<br><span class="note">${esc(d.price_basis || "")}</span></dd>
+    <dt>모든 손절선에 걸릴 때 손실</dt><dd>${d.risk_undefined.length === d.holdings.length ? "손절가를 입력하면 계산됩니다" : `${fmt(d.open_risk)}원 (계좌의 ${pct(d.open_risk_pct, 2)})`}
+      ${d.risk_undefined.length ? `<br><span class="alert">손절가 미정 ${d.risk_undefined.length}종목은 빠져 있음: ${d.risk_undefined.map(esc).join(", ")}</span>` : ""}</dd>
+    <dt>전 종목 하한가 하루</dt><dd>계좌의 −${pct(d.limit_down_loss_pct)} (극단 시나리오)</dd>
+    <dt>가장 큰 한 종목 비중</dt><dd>${pct(d.max_weight)}</dd>
+    ${d.industries.map(g => `<dt>같은 업종(네이버 업종코드 ${esc(g.code)})</dt><dd>${pct(g.weight)} — ${g.names.map(esc).join(", ")}</dd>`).join("")}
+  </dl></div>
+  <div class="card"><h2 class="sec">흔들림 — 현재 비중으로 과거 1년을 다시 돌렸을 때</h2>
+    ${s ? `<dl>
+      <dt>하루 변동성</dt><dd>${pct(s.vol_daily, 2)} (연 ${pct(s.vol_annual)})</dd>
+      <dt>나쁜 날 5% 기준</dt><dd>${pct(s.p5_day, 2)} — 스무 날에 하루는 이보다 나빴음</dd>
+      <dt>가장 나빴던 날</dt><dd>${pct(s.worst_day, 2)} (${esc(s.worst_date)}) · ${fmt(d.total * s.worst_day / 100)}원</dd>
+    </dl><p class="note">${esc(d.stats_note)} · 과거 1년 기준이며 최대 손실이 아닙니다.</p>` : `<p class="note">${esc(d.stats_note)}</p>`}
+  </div>
+  <div class="card"><h2 class="sec">종목별</h2><div class="scroll"><table class="tbl">
+    <tr><th>종목</th><th>비중</th><th>평가금액</th><th>손익</th><th>손절까지 위험</th></tr>
+    ${d.holdings.map(h => `<tr><td>${esc(h.name)}</td><td>${pct(h.weight)}</td><td>${fmt(h.value)}</td>
+      <td>${h.pnl_pct == null ? "-" : `<span style="color:${h.pnl_pct >= 0 ? "var(--up)" : "var(--down)"}">${h.pnl_pct >= 0 ? "+" : ""}${pct(h.pnl_pct)}</span>`}</td>
+      <td>${h.risk == null ? "미정" : fmt(h.risk) + "원"}</td></tr>`).join("")}
+  </table></div></div>
+  ${s && corrRows.length > 1 ? `<div class="card"><h2 class="sec">같이 움직이는 정도 (상관계수, 1에 가까울수록 함께 오르내림)</h2><div class="scroll"><table class="tbl">
+    <tr><th></th>${corrRows.map(c => `<th>${esc(s.names[c])}</th>`).join("")}</tr>
+    ${corrRows.map(a => `<tr><td>${esc(s.names[a])}</td>${corrRows.map(b => { const v = s.corr[a][b];
+      return `<td style="${a !== b && v >= 0.7 ? "color:var(--red);font-weight:600" : ""}">${v == null ? "-" : v.toFixed(2)}</td>`; }).join("")}</tr>`).join("")}
+  </table></div><p class="note">0.7 이상(빨강)은 사실상 같은 베팅이라 분산 효과가 작습니다.</p></div>` : ""}
+  <div class="card"><h2 class="sec">점검 항목 (화면을 열 때 계산 · 알림 발송 없음)</h2>
+    ${alerts.length ? `<ul>${alerts.map(h => `<li><b>${esc(h.name)}</b>
+      ${h.alerts.map(a => `<div class="alert">${esc(a)}</div>`).join("")}
+      ${(h.disclosures || []).map(x => `<div class="note">공시(네이버 목록, 중요도 미구분) ${esc(x.date)} · ${esc(x.title)}</div>`).join("")}</li>`).join("")}</ul>`
+      : `<p class="note">손절선 이탈·변동성 급증·20일 고점 대비 −15%·최근 7일 공시 없음</p>`}
+  </div>
+  ${d.errors.length ? `<div class="card err">${d.errors.map(esc).join("<br>")}</div>` : ""}`;
+}
+
+// ── 종목 상태 (기존 신호등) ──
+let current = "";
+picker($("#q"), (code, name) => { $("#q").value = name; load(code); });
+async function load(code) {
+  current = code;
+  history.replaceState(null, "", "#" + code);
+  $("#out").innerHTML = '<p class="empty">불러오는 중…</p>';
+  try { render(await api("/api/diagnose/" + code)); }
+  catch (e) { $("#out").innerHTML = `<div class="card err">${esc(e.message)}</div>`; }
+}
+function chart(points) {
+  if (points.length < 2) return "";
+  const W = 700, H = 160, P = 4, cs = points.map(p => p.c);
+  const ma = n => cs.map((_, i) => i < n - 1 ? null : cs.slice(i - n + 1, i + 1).reduce((a, b) => a + b) / n);
+  const keep = Math.min(120, cs.length), cut = a => a.slice(-keep);
+  const m20 = cut(ma(20)), m60 = cut(ma(60));
+  cs.splice(0, cs.length - keep); points = points.slice(-keep);
+  const all = cs.concat(m20, m60).filter(v => v != null);
+  const lo = Math.min(...all), hi = Math.max(...all), span = hi - lo || 1;
+  const x = i => P + i * (W - 2 * P) / (cs.length - 1), y = v => H - P - (v - lo) / span * (H - 2 * P);
+  const path = arr => arr.map((v, i) => v == null ? "" : `${arr[i - 1] == null ? "M" : "L"}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join("");
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="최근 종가와 이동평균">
+    <path d="${path(m60)}" fill="none" stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 3" vector-effect="non-scaling-stroke"/>
+    <path d="${path(m20)}" fill="none" stroke="var(--yellow)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+    <path d="${path(cs)}" fill="none" stroke="var(--accent)" stroke-width="2" vector-effect="non-scaling-stroke"/>
+  </svg>
+  <div class="legend"><span><i style="background:var(--accent)"></i>종가</span><span><i style="background:var(--yellow)"></i>MA20</span>
+  <span><i style="background:var(--muted)"></i>MA60</span><span>${esc(points[0].d)} ~ ${esc(points.at(-1).d)}</span></div>`;
+}
+
+function render(d) {
+  const chg = parseFloat(d.change_pct);
+  const color = chg > 0 ? "var(--up)" : chg < 0 ? "var(--down)" : "var(--ink)";
+  const status = {OPEN: "장중", CLOSE: "장 마감", PREOPEN: "장 시작 전"}[d.market_status] || d.market_status || "";
+  const c = d.counts;
+  const risk = d.risk ? `<div class="card"><h2 class="sec">변동성 (계산값)</h2><dl>
+      <dt>ATR14</dt><dd>${fmt(d.risk.atr)}원 (${d.risk.atr_pct.toFixed(1)}%)</dd>
+      <dt>종가 − 2×ATR</dt><dd>${fmt(d.risk.stop_2atr)}원 (${d.risk.stop_pct.toFixed(1)}%)</dd></dl>
+      <p class="meta">ATR은 하루 평균 움직임 폭입니다. 2×ATR 손절은 흔히 쓰는 예시일 뿐 이 앱에서 검증하지 않았습니다.</p></div>` : "";
+  const ref = Object.entries(d.reference);
+  $("#out").innerHTML = `
+  <div class="card">
+    <div class="head"><h2>${esc(d.name)}</h2><span class="meta">${esc(d.code)} · ${esc(d.market)}${d.is_etf ? " · ETF" : ""}</span></div>
+    <div class="head" style="margin-top:6px"><span class="price">${fmt(d.last_close)}원</span>
+      <span style="color:${color};font-weight:600">${isNaN(chg) ? "" : (chg > 0 ? "+" : "") + chg + "%"}</span>
+      <span class="meta">KRX 종가 기준 · ${esc(status)}${d.market_status === "OPEN" ? ` (현재가 ${esc(d.price_now)}원)` : ""}</span></div>
+    <div class="tally">
+      <span><span class="dot green"></span>충족 ${c.green}</span><span><span class="dot yellow"></span>혼조 ${c.yellow}</span>
+      <span><span class="dot red"></span>미충족 ${c.red}</span>${c.grey ? `<span><span class="dot grey"></span>자료 부족 ${c.grey}</span>` : ""}</div>
+    <p class="meta">${esc(d.basis)}</p>
+  </div>
+  <div class="card">${chart(d.chart)}</div>
+  <div class="card"><h2 class="sec">스윙 조건 신호등</h2>
+    ${d.lights.map(l => `<div class="light"><span class="dot ${l.color}"></span>
+      <div><b>${esc(l.title)}</b><span class="tag">${LABEL[l.color]}</span></div>
+      <div class="val">${esc(l.value)}</div><div class="rule">${esc(l.rule)}</div>
+      ${l.validation ? `<div class="rule bt">📊 ${esc(l.validation)}</div>` : ""}</div>`).join("")}
+  </div>
+  ${risk}
+  ${ref.length ? `<div class="card"><h2 class="sec">참고 지표 (신호등에 미반영)</h2><dl>${ref.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl></div>` : ""}
+  ${d.researches.length ? `<div class="card"><h2 class="sec">최근 증권사 리포트</h2><ul>${d.researches.map(r => `<li>${esc(r.title)} <small>${esc(r.broker)} · ${esc(r.date)}</small></li>`).join("")}</ul></div>` : ""}
+  ${d.errors.length ? `<div class="card err">${d.errors.map(esc).join("<br>")}</div>` : ""}
+  <div class="card warn">⚠️ <b>백테스트 결과: 예측력 없음</b> — 시총 상위 250종목·2012~2026 검증에서 어떤 신호등도 초록이 빨강보다 의미 있게 더 오르지 않았습니다. 가격 신호등 4개(수급 제외)가 모두 초록인 종목은 검증 구간(2020~)에서 오히려 평균보다 −1.4% 낮았습니다(유의하지 않음). 이 화면은 종목의 현재 상태를 요약하는 용도이며, 매수 시점을 알려주지 않습니다. 생존편향(상장폐지 종목 누락)이 있어 실제는 더 나쁠 수 있습니다. 데이터: 네이버 금융(비공식).</div>`;
+}
+
+
+function fromHash() {
+  const code = location.hash.slice(1);
+  if (/^[0-9A-Z]{6}$/.test(code) && code !== current) { showTab("stock"); load(code); return true; }
+  return false;
+}
+window.addEventListener("hashchange", fromHash);
+if (!fromHash()) showTab(store.get("tab") || "size");
+</script>
+</body>
+</html>

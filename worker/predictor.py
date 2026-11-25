@@ -894,8 +894,9 @@ class TrendFollowingPredictor(BasePredictor):
 
     def predict_with_confidence(self, market_data: MarketData) -> Tuple[str, float]:
         if self._session_factory is None:
-            logger.warning("⚠️ [TrendFollowing] session_factory 미주입 → RuleBased 폴백")
-            return self._fallback.predict_with_confidence(market_data)
+            # 엣지 없는 1m 평균회귀로 폴백하면 추세 포지션을 뒤집을 수 있음 → HOLD
+            logger.error("❌ [TrendFollowing] session_factory 미주입 → HOLD")
+            return "HOLD", 0.0
         try:
             if isinstance(market_data, dict):
                 symbol = market_data.get("symbol", "BTC/USDT")
@@ -946,9 +947,9 @@ class TrendFollowingPredictor(BasePredictor):
             return sig, conf
         except Exception as exc:
             logger.error(
-                "❌ [TrendFollowing] 추론 예외 → RuleBased 폴백: %s", exc, exc_info=True
+                "❌ [TrendFollowing] 추론 예외 → HOLD (평균회귀 폴백 금지): %s", exc, exc_info=True
             )
-            return self._fallback.predict_with_confidence(market_data)
+            return "HOLD", 0.0
 
     def predict(self, market_data: MarketData) -> str:
         action, _ = self.predict_with_confidence(market_data)

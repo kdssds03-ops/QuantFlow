@@ -32,7 +32,17 @@ def main():
     mode = "🔴 실전(Mainnet)" if not s.exchange_sandbox else "🟡 샌드박스(Demo)"
     import os
     print(f"  거래소 모드 : {mode}")
-    print(f"  예측 엔진   : {os.getenv('PREDICTOR_TYPE', 'RULE')}")
+    # PREDICTOR_TYPE은 Settings 필드가 아니라 os.environ으로 읽힌다. 호스트 실행 시
+    # .env가 환경변수로 로드되지 않으므로 .env에서도 찾아 컨테이너와 같은 값을 보여준다.
+    predictor = os.getenv("PREDICTOR_TYPE")
+    if predictor is None:
+        try:
+            from dotenv import dotenv_values
+            predictor = dotenv_values(Path(__file__).resolve().parent.parent / ".env").get("PREDICTOR_TYPE")
+        except Exception:
+            predictor = None
+    predictor = (predictor or "RULE").split("#")[0].strip().upper()
+    print(f"  예측 엔진   : {predictor}")
     print(f"  진입 사이징 : {s.risk_factor*100:.0f}% (RISK_FACTOR)")
     print(f"  서킷브레이커: {('-'+str(s.max_daily_loss_pct*100)+'%') if s.max_daily_loss_pct>0 else '비활성(0)'}")
     print("-" * 60)
@@ -129,10 +139,17 @@ def main():
         check("거래소 API 키", FAIL, str(e)[:80])
 
     # ── 텔레그램 ──
+    # 주문 실패·청산 미완료·포지션 조회 실패 경보가 전부 텔레그램이므로 실전에선 필수.
     if s.telegram_bot_token and s.telegram_chat_id:
         check("텔레그램 설정", PASS, "토큰/챗ID 존재 (/pause·알림 가능)")
     else:
-        check("텔레그램 설정", WARN, "미설정 — 알림/원격 /pause 불가")
+        check("텔레그램 설정", WARN if s.exchange_sandbox else FAIL,
+              "미설정 — 주문 실패/청산 미완료 경보와 원격 /pause 불가")
+    if not s.exchange_sandbox and s.healthcheck_alert_only:
+        check("헬스체크 생존 신호", WARN,
+              "HEALTHCHECK_ALERT_ONLY=true — 봇이 통째로 죽으면 아무 알림도 안 옴. 초기 실전은 false 권장")
+    if predictor != "TREND":
+        check("예측 엔진", WARN, f"PREDICTOR_TYPE={predictor} — 검증된 전략은 TREND")
 
     # ── 요약 ──
     print("-" * 60)

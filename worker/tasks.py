@@ -24,6 +24,7 @@ import json
 import logging
 import math
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import TypedDict, Optional
@@ -232,7 +233,16 @@ _PYRAMID_COUNT_TTL_SEC    = 86400  # 24h 백스톱 (RULE/ML 모드 포지션 수
 # ── [결함 #1] 중복 주문 방지용 Redis 분산 락 설정 ─────────────────────────
 # 동일 심볼에 대한 analyze_and_trade 태스크가 30초 이내 재진입할 경우 즉시 Skip.
 # Redis SETNX + EXPIRE 조합: 락 획득에 성공한 프로세스만 매매 로직을 실행.
-_ORDER_DEDUP_LOCK_TTL_SEC = 30  # 심볼별 락 유효 시간 (초) — 이 시간 내 재트리거 무시
+# 120초: 잔고 재시도(~30s) + 주문 재시도·폴링(~15s)을 넉넉히 넘겨, 실행 도중 락이
+# 만료돼 다음 트리거가 같은 심볼로 진입하는 경합을 막는다 (과거 30s는 초과 가능했음).
+_ORDER_DEDUP_LOCK_TTL_SEC = 120  # 심볼별 락 유효 시간 (초)
+# 소유자 확인 후 삭제 — 만료 후 다른 태스크가 잡은 락을 지우지 않도록.
+_LOCK_RELEASE_LUA = (
+    "if redis.call('get', KEYS[1]) == ARGV[1] then "
+    "return redis.call('del', KEYS[1]) else return 0 end"
+)
+# 시세 신선도 한도: 최신 1m 봉이 이보다 오래되면 수집 정지로 보고 신규 진입 동결.
+_STALE_DATA_MAX_SEC = 300
 _ORDER_DEDUP_LOCK_PREFIX  = "quantflow:order_lock:"  # Redis 키 네임스페이스
 
 # ── [v5.0] 시장 국면 판독기(Regime Classifier) 임계치 ──────────────────────
@@ -377,6 +387,58 @@ def _reset_position_state(symbol: str) -> None:
 # ─────────────────────────────────────────────
 # 🛡️ [Phase 3] 주문 집행 파이프라인 결과 타입
 # ─────────────────────────────────────────────
+def _alert_throttled(key: str, message: str, ttl_sec: int = 1800) -> None:
+    """같은 key의 경보는 ttl_sec 동안 1회만 발송 (매분 반복 장애의 알림 폭주 방지).
+    Redis를 못 쓰면 억제 없이 발송한다 — 경보 누락보다 중복이 낫다."""
+    try:
+        if _r_sync is not None and not _r_sync.set(f"quantflow:alert:{key}", "1", nx=True, ex=ttl_sec):
+            return
+    except Exception:
+        pass
+    notifier.send_message(message)
+
+
+def _alert_order_problem(trigger_type: str, symbol: str, side: str, amount, client_oid: str, reason: str) -> None:
+    """주문이 실패했거나 체결 여부가 불명할 때의 긴급 경보 (과거: 로그만 남고 무음)."""
+    notifier.send_message(
+        f"🚨 <b>[QuantFlow] 주문 실패/상태 불명 — 확인 필요</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>트리거:</b> <code>{trigger_type}</code>\n"
+        f"• <b>심볼:</b> <code>{symbol}</code> / <b>방향:</b> <code>{side.upper()}</code>\n"
+        f"• <b>요청 수량:</b> <code>{float(amount)}</code>\n"
+        f"• <b>clientOrderId:</b> <code>{client_oid}</code>\n"
+        f"• <b>원인:</b> <code>{reason[:300]}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def _alert_exit_incomplete(trigger_type: str, symbol: str, result: "OrderResult") -> None:
+    """청산 주문이 완전 체결되지 않음 → 포지션이 남아 있을 수 있음을 경보."""
+    notifier.send_message(
+        f"🚨 <b>[QuantFlow] 청산 미완료 — 포지션 잔존 가능</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>트리거:</b> <code>{trigger_type}</code>\n"
+        f"• <b>심볼:</b> <code>{symbol}</code>\n"
+        f"• <b>상태:</b> <code>{result['status']}</code> (체결 {result['filled_amount']})\n"
+        f"• <b>사유:</b> <code>{(result['reject_reason'] or '-')[:300]}</code>\n"
+        f"• 다음 사이클에 재시도됩니다. 반복되면 거래소에서 직접 청산하세요.\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def _save_history_safe(coro) -> None:
+    """주문 '이후'의 이력 저장 실패가 예외로 번져 상태 정리·알림을 건너뛰거나
+    태스크 retry(재주문)를 유발하지 않도록 격리한다."""
+    try:
+        _run_async_safe(coro)
+    except Exception as exc:
+        logger.error("❌ [이력 저장] 체결 후 DB 기록 실패 (주문 자체는 처리됨): %s", exc, exc_info=True)
+        _alert_throttled(
+            "history_save_failed",
+            f"⚠️ <b>[QuantFlow] 거래 이력 DB 저장 실패</b>\n주문은 처리됐으나 기록 누락. 원인: <code>{str(exc)[:200]}</code>",
+        )
+
+
 class OrderResult(TypedDict):
     """
     _execute_order_pipeline() 반환 타입 정의.
@@ -401,6 +463,7 @@ def _execute_order_pipeline(
     fallback_price: Decimal,
     confidence: float,
     usdt_balance: Decimal,
+    reduce_only: bool = False,
 ) -> OrderResult:
     """
     금융권 프로덕션 등급 주문 집행 파이프라인.
@@ -428,6 +491,21 @@ def _execute_order_pipeline(
     _filled_price: Decimal = fallback_price
     _filled_amount: Decimal = Decimal("0")
 
+    # 재시도 전체에서 동일한 clientOrderId를 쓴다. 타임아웃이 '서버는 이미 체결'일 수
+    # 있으므로, 재송신 전에 이 ID로 존재 여부를 조회해 중복 주문을 막는다.
+    _client_oid = f"qf{uuid.uuid4().hex[:28]}"
+    _order_params: dict = {"newClientOrderId": _client_oid}
+    if reduce_only:
+        # 청산 주문은 reduceOnly — 중복/초과 수량이 반대 포지션을 새로 여는 것을 차단
+        _order_params["reduceOnly"] = True
+
+    def _lookup_existing_order() -> dict | None:
+        """clientOrderId로 이미 접수된 주문 조회. 없으면 None, 조회 불가면 예외 전파."""
+        try:
+            return exchange.fetch_order(None, symbol, params={"origClientOrderId": _client_oid})
+        except ccxt.OrderNotFound:
+            return None
+
     # ── STEP 1: Exponential Backoff Retry 가드 ──────────────────────────────
     # tenacity를 인라인 클로저로 감싸 재시도 로직을 캡슐화.
     # InsufficientFunds / InvalidOrder는 즉시 re-raise → retry 없이 탈출.
@@ -440,6 +518,16 @@ def _execute_order_pipeline(
         last_exc: Exception | None = None
 
         for attempt in range(1, _ORDER_RETRY_MAX_ATTEMPTS + 1):
+            if attempt > 1:
+                # 직전 시도가 실제로 접수됐는지 먼저 확인. 조회 자체가 실패하면
+                # 상태 불명이므로 재송신하지 않고 예외로 중단한다(중복 체결 방지).
+                existing = _lookup_existing_order()
+                if existing is not None:
+                    logger.warning(
+                        "♻️ [%s] 타임아웃 주문이 실제로 접수돼 있음 (clientOrderId=%s) — 재송신 생략",
+                        trigger_type, _client_oid,
+                    )
+                    return existing
             try:
                 logger.info(
                     "📡 [%s] create_order 시도 %d/%d — %s %s BTC",
@@ -450,6 +538,7 @@ def _execute_order_pipeline(
                     type="market",
                     side=side.lower(),
                     amount=float(amount),
+                    params=dict(_order_params),
                 )
             except (ccxt.InsufficientFunds, ccxt.InvalidOrder):
                 # 하드웨어/자산 한계 — 재시도 불가, 즉시 상위로 전파
@@ -477,6 +566,11 @@ def _execute_order_pipeline(
                 logger.error("❌ [%s] 예상치 못한 시스템 오류 — 재시도 없이 중단: %s", trigger_type, exc)
                 break
 
+        if isinstance(last_exc, (ccxt.NetworkError, ccxt.RequestTimeout)):
+            # 마지막 타임아웃도 서버 체결일 수 있음 — 한 번 더 확인해 기록 누락 방지
+            existing = _lookup_existing_order()
+            if existing is not None:
+                return existing
         raise last_exc or RuntimeError("create_order 알 수 없는 실패")
 
     # ── STEP 1 실행: 자산/수량 한계 예외 Strict Catching ──────────────────
@@ -524,6 +618,7 @@ def _execute_order_pipeline(
         # 재시도 소진 또는 기타 예외
         fail_reason = f"주문 집행 최종 실패: {exc}"
         logger.error("❌ [%s] %s", trigger_type, fail_reason)
+        _alert_order_problem(trigger_type, symbol, side, amount, _client_oid, fail_reason)
         return OrderResult(
             status="FAILED", order_id="unknown",
             filled_price=fallback_price, filled_amount=Decimal("0"),
@@ -622,7 +717,30 @@ def _execute_order_pipeline(
             logger.error(
                 "❌ [%s] cancel_order 실패 (수동 확인 필요!): %s", trigger_type, exc
             )
-            # cancel 실패 시에도 파이프라인은 FAILED 반환으로 안전 종료
+            # cancel 실패의 흔한 원인은 '이미 체결됨' — 재조회로 실제 체결 여부를 확정
+            try:
+                refetched = exchange.fetch_order(_order_id, symbol)
+                if str(refetched.get("status", "")).lower() in ("closed", "filled"):
+                    _filled_amount = Decimal(str(refetched.get("filled") or 0))
+                    _filled_price = Decimal(str(
+                        refetched.get("average") or refetched.get("price") or fallback_price
+                    ))
+                    notifier.notify_trade(
+                        trigger_type=trigger_type, symbol=symbol, side=side,
+                        price=_filled_price, amount=_filled_amount, order_id=_order_id,
+                        confidence=confidence, balance=usdt_balance,
+                    )
+                    return OrderResult(
+                        status="FILLED", order_id=_order_id,
+                        filled_price=_filled_price, filled_amount=_filled_amount,
+                        reject_reason="",
+                    )
+            except ccxt.BaseError as refetch_exc:
+                logger.error("❌ [%s] cancel 실패 후 재조회도 실패: %s", trigger_type, refetch_exc)
+            _alert_order_problem(
+                trigger_type, symbol, side, amount, _client_oid,
+                f"cancel_order 실패 — 체결 여부 불명, 거래소에서 직접 확인 필요: {exc}",
+            )
             return OrderResult(
                 status="FAILED", order_id=_order_id,
                 filled_price=_filled_price, filled_amount=_filled_amount,
@@ -663,8 +781,9 @@ def _execute_order_pipeline(
         )
 
     # ── 그 외 알 수 없는 상태 ─────────────────────────────────────────────
-    unknown_reason = f"거래소 반환 알 수 없는 status: '{raw_status}'"
+    unknown_reason = f"거래소 반환 알 수 없는 status: '{raw_status}' (filled={_filled_amount})"
     logger.error("❌ [%s] %s", trigger_type, unknown_reason)
+    _alert_order_problem(trigger_type, symbol, side, amount, _client_oid, unknown_reason)
     return OrderResult(
         status="FAILED", order_id=_order_id,
         filled_price=_filled_price, filled_amount=_filled_amount,
@@ -1026,7 +1145,8 @@ def _get_lot_size_step(
             "⚠️ [LOT_SIZE] %s stepSize 조회 실패 → fallback=%s 적용: %s",
             symbol, fallback_step, _lot_exc,
         )
-        step = Decimal(fallback_step)
+        # 일시 실패의 fallback은 캐시하지 않는다 — 재시작 전까지 잘못된 step이 고정되던 결함
+        return Decimal(fallback_step)
 
     _LOT_SIZE_CACHE[symbol] = step
     logger.info("🔒 [LOT_SIZE] %s stepSize 확정: %s", symbol, step)
@@ -1180,8 +1300,13 @@ def _check_daily_loss_breaker(current_equity: Decimal) -> bool:
         limit = Decimal(str(settings.max_daily_loss_pct))
     except (InvalidOperation, TypeError):
         return False
-    if limit <= Decimal("0") or _r_sync is None:
+    if limit <= Decimal("0"):
         return False
+    if _r_sync is None or current_equity <= Decimal("0"):
+        # 브레이커를 평가할 수 없음(Redis 없음/잔고 이상) → 신규 진입 동결 쪽으로 착지.
+        # 잔고 0을 기준 자본으로 기록하면 그날 브레이커가 꺼지던 결함도 함께 차단.
+        logger.error("🚨 [서킷브레이커] 평가 불가 (redis=%s, equity=%s) → 진입 동결", _r_sync is not None, current_equity)
+        return True
     try:
         kst_date = datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
         key = f"quantflow:day_start_equity:{kst_date}"
@@ -1218,8 +1343,8 @@ def _check_daily_loss_breaker(current_equity: Decimal) -> bool:
             return True
         return False
     except Exception as exc:
-        logger.warning("⚠️ [서킷브레이커] 검사 중 예외 (매매 계속): %s", exc)
-        return False
+        logger.error("🚨 [서킷브레이커] 검사 중 예외 → 신규 진입 동결: %s", exc)
+        return True
 
 
 def _maybe_auto_resume_breaker(r) -> bool:
@@ -1823,6 +1948,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
     _lock_key = f"{_ORDER_DEDUP_LOCK_PREFIX}{_normalize_symbol(symbol)}"
     _r_lock = _r_sync  # 싱글턴 재사용
     _lock_held = False  # 우리가 락을 실제로 점유했는지 추적 — finally에서 해제 판단용
+    _lock_token = uuid.uuid4().hex  # 소유자 식별 — 남의 락을 지우지 않기 위함
     try:
         if _r_lock is None:
             # 싱글턴 초기화 실패 시에만 임시 연결 생성
@@ -1831,7 +1957,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
             )
         # NX=True: 키가 없을 때만 SET (원자적 SETNX)
         # EX: TTL(초) 자동 설정 → 워커 크래시 시 락 영구 잠금 방지
-        _lock_acquired = _r_lock.set(_lock_key, "1", nx=True, ex=_ORDER_DEDUP_LOCK_TTL_SEC)
+        _lock_acquired = _r_lock.set(_lock_key, _lock_token, nx=True, ex=_ORDER_DEDUP_LOCK_TTL_SEC)
         if _lock_acquired:
             _lock_held = True
         if not _lock_acquired:
@@ -1875,7 +2001,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                         "(보유 포지션 보호 가드는 계속 작동)"
                     )
         except Exception as _status_exc:
-            logger.warning("⚠️ [원격 제어] sys_status 조회 실패 (매매 계속 진행): %s", _status_exc)
+            # PAUSED/브레이커 상태를 확인할 수 없으면 신규 진입만 동결 (청산 가드는 계속)
+            _trading_frozen = True
+            logger.error("🚨 [원격 제어] sys_status 조회 실패 → 신규 진입 동결: %s", _status_exc)
+            _alert_throttled(
+                "sys_status_unreadable",
+                f"🚨 <b>[QuantFlow] Redis 상태 조회 실패 — 신규 진입 동결</b>\n원인: <code>{str(_status_exc)[:200]}</code>",
+            )
 
         exchange = get_exchange()
 
@@ -2027,6 +2159,30 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
 
             current_close = Decimal(str(latest.close))
 
+            # ── [신선도 가드] 수집 태스크가 멈춰 최신 봉이 오래됐으면 신규 진입 동결 ──
+            # 청산 판단은 거래소 실시세로 대체해 낡은 가격으로 손절을 판단하지 않게 한다.
+            _ts = latest.timestamp if latest.timestamp.tzinfo else latest.timestamp.replace(tzinfo=timezone.utc)
+            _age_sec = (now_utc - _ts).total_seconds()
+            if _age_sec > _STALE_DATA_MAX_SEC:
+                _trading_frozen = True
+                logger.error("🚨 [신선도] %s 최신 봉 %.0f초 경과 → 신규 진입 동결", symbol, _age_sec)
+                _alert_throttled(
+                    f"stale_data:{_normalize_symbol(symbol)}",
+                    f"🚨 <b>[QuantFlow] 시세 데이터 정지 — 신규 진입 동결</b>\n"
+                    f"• 심볼: <code>{symbol}</code>\n• 최신 봉 경과: <code>{_age_sec/60:.1f}분</code>\n"
+                    f"• market_data 수집(beat/worker) 상태를 확인하세요.",
+                )
+                try:
+                    current_close = Decimal(str(exchange.fetch_ticker(symbol)["last"]))
+                except Exception as _tk_exc:
+                    logger.error("❌ [신선도] 실시세 조회도 실패 → 사이클 중단: %s", _tk_exc)
+                    _alert_throttled(
+                        f"stop_watch_blind:{_normalize_symbol(symbol)}",
+                        f"🚨 <b>[QuantFlow] 시세 정지 + 실시세 조회 실패 — 손절 감시 불가</b>\n"
+                        f"• 심볼: <code>{symbol}</code>\n• 보유 포지션이 있다면 거래소에서 직접 확인하세요.",
+                    )
+                    return {"status": "stale_data", "symbol": symbol}
+
             # ─────────────────────────────────────────────────────────────────
             # 3. 🛡️ [수석 아키텍트 명세 #2] 포지션 판정 파이프라인 — 100% 원격 API 기반
             # ─────────────────────────────────────────────────────────────────
@@ -2062,10 +2218,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                         # info 딕셔너리에서 직접 추출하여 float 안전 변환 수행.
                         _info = _p.get("info", {})
                         _pa_raw = _info.get("positionAmt", "0")
-                        try:
-                            _pa_float = float(_pa_raw)
-                        except (TypeError, ValueError):
-                            _pa_float = 0.0
+                        _pa_float = float(_pa_raw)  # 파싱 실패 → 예외 → 사이클 중단 (FLAT 오판 금지)
 
                         # 단방향(One-Way) 포지션 판정: positionAmt 부호로 방향 결정
                         if _pa_float > 0.0:
@@ -2092,10 +2245,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     if isinstance(_pos_risk_list, list):
                         for _pr in _pos_risk_list:
                             _pa_raw = _pr.get("positionAmt", "0")
-                            try:
-                                _pa_float = float(_pa_raw)
-                            except (TypeError, ValueError):
-                                _pa_float = 0.0
+                            _pa_float = float(_pa_raw)  # 파싱 실패 → 예외 → 사이클 중단 (FLAT 오판 금지)
 
                             if _pa_float > 0.0:
                                 current_position = "LONG"
@@ -2119,15 +2269,20 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 )
 
             except Exception as _pos_api_exc:
-                # API 조회 실패 시 안전하게 FLAT 처리 → 신규 진입/추가 주문 봉쇄.
-                # (포지션 불명 상태에서 추가 진입은 자산 위험을 배가시킬 수 있음)
+                # 포지션 불명 → 이번 사이클 전체 중단. (과거: FLAT으로 처리했는데 FLAT은
+                # '신규 진입 허용' 상태라, 보유 중 조회가 한 번 실패하면 중복 진입·반대 진입이
+                # 나가고 손절 방패도 건너뛰는 결함이었음)
                 logger.error(
-                    "🚨 [포지션 판정 - API 실패] 원격 포지션 조회 실패 → FLAT 보수 처리 (신규 주문 봉쇄): %s",
+                    "🚨 [포지션 판정 - API 실패] 원격 포지션 조회 실패 → 이번 사이클 중단: %s",
                     _pos_api_exc, exc_info=True,
                 )
-                current_position = "FLAT"
-                entry_price      = None
-                pos_contracts    = Decimal("0")
+                _alert_throttled(
+                    f"pos_fetch_failed:{_normalize_symbol(symbol)}",
+                    f"🚨 <b>[QuantFlow] 포지션 조회 실패 — 매매 사이클 중단</b>\n"
+                    f"• 심볼: <code>{symbol}</code>\n• 원인: <code>{str(_pos_api_exc)[:200]}</code>\n"
+                    f"• 계속되면 거래소 API/키 상태를 확인하세요.",
+                )
+                return {"status": "position_fetch_failed", "symbol": symbol}
 
             # ── [동결 게이트] PAUSED/브레이커 + 무포지션 → 여기서 종료 ──────────
             # 포지션 보유 중이면 계속 진행해 아래 보호 가드(손절 방패·하드 가드·
@@ -2172,12 +2327,13 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                         fallback_price=current_close,
                         confidence=1.0,
                         usdt_balance=usdt_balance,
+                        reduce_only=True,
                     )
 
                     # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
                     # asyncio.run() 직접 호출 시 동기 세션 홀드 중 커넥션 풀 경합 Deadlock 유발.
                     sl_record_amount = sl_result["filled_amount"] if sl_result["filled_amount"] > Decimal("0") else calculated_amount
-                    _run_async_safe(_async_save_trade_history(
+                    _save_history_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
                         side=_exit_side,
@@ -2191,7 +2347,11 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     )
 
                     # 포지션 종료 — Peak ROI/불타기 카운터 잔류 상태 정리
-                    _reset_position_state(symbol)
+                    # (완전 체결일 때만. 미체결/부분체결이면 포지션이 남아 있으므로 상태 유지 + 경보)
+                    if sl_result["status"] == "FILLED":
+                        _reset_position_state(symbol)
+                    else:
+                        _alert_exit_incomplete("STOP_LOSS_SHIELD", symbol, sl_result)
 
                     return {"status": f"stop_loss_{sl_result['status'].lower()}", "order_id": sl_result["order_id"]}
 
@@ -2295,6 +2455,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                         fallback_price=current_close,
                         confidence=1.0,
                         usdt_balance=usdt_balance,
+                        reduce_only=True,
                     )
                     _hard_rec_amount = (
                         _hard_result["filled_amount"]
@@ -2302,7 +2463,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                         else _hard_amount
                     )
                     # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
-                    _run_async_safe(_async_save_trade_history(
+                    _save_history_safe(_async_save_trade_history(
                         timestamp=datetime.now(timezone.utc),
                         symbol=symbol,
                         side=_exit_side,
@@ -2312,6 +2473,10 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                     ))
 
                     # ── 청산 완료 — Peak ROI/불타기 카운터 잔류 상태 일괄 정리 ──
+                    # 미완료 청산이면 상태 유지 + 긴급 경보 후 종료 ('청산 완료' 오알림 방지)
+                    if _hard_result["status"] != "FILLED":
+                        _alert_exit_incomplete(_hard_trigger, symbol, _hard_result)
+                        return {"status": f"{_hard_trigger.lower()}_{_hard_result['status'].lower()}", "order_id": _hard_result["order_id"]}
                     _reset_position_state(symbol)
                     logger.info(
                         "🧹 [%s] 포지션 파생 상태 정리 완료 (symbol=%s, key=%s)",
@@ -2583,7 +2748,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                                 if _pyr_result["filled_amount"] > Decimal("0")
                                 else _add_amount
                             )
-                            _run_async_safe(_async_save_trade_history(
+                            _save_history_safe(_async_save_trade_history(
                                 timestamp=datetime.now(timezone.utc),
                                 symbol=symbol,
                                 side="BUY",
@@ -2658,6 +2823,11 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 # 단일 심볼: RISK_FACTOR × 변동성타겟 배율(비활성 시 1.0)
                 _EFFECTIVE_RISK = RISK_FACTOR * _vol_target_scale(symbol)
             _step = _get_lot_size_step(exchange, symbol, fallback_step="0.001")
+            if _EFFECTIVE_RISK <= 0 and current_position == "FLAT" and action in ("BUY", "SELL"):
+                # 포트폴리오 사이징 0(데이터 부족/오류) = 진입 보류. 아래 0.001 하한 승격이
+                # 이를 최소수량 진입으로 바꿔버리던 결함 차단. (보유 포지션 청산은 영향 없음)
+                logger.warning("⏸️ [사이징 0] %s 진입 보류 (데이터 부족/오류)", symbol)
+                return {"status": "sizing_zero", "symbol": symbol}
             
             # 0 나눗셈 및 math.isnan 방어 가드
             if current_close is None or current_close <= Decimal("0") or math.isnan(float(current_close)):
@@ -2824,6 +2994,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 fallback_price=current_close,
                 confidence=confidence,
                 usdt_balance=usdt_balance,
+                reduce_only=trigger_type in ("REVERSE_SWITCH_EXIT_LONG", "REVERSE_SWITCH_EXIT_SHORT"),
             )
 
             # 이력 저장 — [교착 방지] _run_async_safe()로 스레드 격리 실행
@@ -2833,7 +3004,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
                 if exec_result["filled_amount"] > Decimal("0")
                 else calculated_amount
             )
-            _run_async_safe(_async_save_trade_history(
+            _save_history_safe(_async_save_trade_history(
                 timestamp=now_utc,
                 symbol=symbol,
                 side=action,
@@ -2848,7 +3019,10 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
 
             # 역시그널 청산으로 포지션이 닫힌 경우 — Peak ROI/불타기 카운터 잔류 정리
             if trigger_type in ("REVERSE_SWITCH_EXIT_LONG", "REVERSE_SWITCH_EXIT_SHORT"):
-                _reset_position_state(symbol)
+                if exec_result["status"] == "FILLED":
+                    _reset_position_state(symbol)
+                else:
+                    _alert_exit_incomplete(trigger_type, symbol, exec_result)
 
             return {
                 "status": exec_result["status"].lower(),
@@ -2869,7 +3043,7 @@ def analyze_and_trade(self, symbol: str = "BTC/USDT"):  # noqa: C901
         # (self.retry()는 내부적으로 예외를 재발생시키므로 이 finally는 그 직전에 실행됨)
         if _lock_held and _r_lock is not None:
             try:
-                _r_lock.delete(_lock_key)
+                _r_lock.eval(_LOCK_RELEASE_LUA, 1, _lock_key, _lock_token)
                 logger.debug("🔓 [중복 주문 방지] '%s' 심볼 락 해제 완료", symbol)
             except Exception as _unlock_exc:
                 logger.warning(

@@ -76,6 +76,16 @@ def get_exchange() -> ccxt.Exchange:
                     "fapi.binance.com", "demo-fapi.binance.com"
                 )
 
+        # 치환이 실제로 됐는지 검증 — ccxt URL 구조가 바뀌어 치환이 0건이면
+        # '데모 모드' 로그와 달리 실전(mainnet)으로 주문이 나가므로 즉시 중단한다.
+        _api_urls = [u for u in exchange.urls["api"].values() if isinstance(u, str)]
+        if any("://fapi.binance.com" in u for u in _api_urls) or not any(
+            "demo-fapi.binance.com" in u for u in _api_urls
+        ):
+            raise RuntimeError(
+                "EXCHANGE_SANDBOX=true인데 데모 URL 치환 실패 — 실전 주문 방지를 위해 중단합니다"
+            )
+
         logger.info(
             "🟡 [BINANCE-USDM] 신형 데모 모드 활성화\n"
             "   [1] binanceusdm → fetch_markets()가 fapi만 호출\n"

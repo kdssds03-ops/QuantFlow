@@ -48,7 +48,8 @@
 - **전략 토글(.env)**: `PREDICTOR_TYPE=TREND`, `RISK_FACTOR`(사이징, 현행 0.50), `VOL_TARGET_ENABLED=false`(현행), `MAX_DAILY_LOSS_PCT`(서킷브레이커, 현행 0.05), `MAX_CAPITAL_PER_SYMBOL_PCT`(자본 방화벽, 현행 0.60 — **반드시 RISK_FACTOR×vol_scale_max보다 클 것**, 작으면 전 주문 거부=무거래).
 - **TREND 워밍업**: 신호 발화 최소 4h봉 ≥62개(≈10일 연속 1m), **백테스트와 EMA 일치엔 260개(≈43일) 필요**(predictor가 그만큼 조회 — 짧으면 EMA 시드 편향으로 4h봉의 ~3%에서 신호 뒤집힘). `scripts/backfill_symbol_1m.py`로 과거 1m 백필 가능.
 - **TREND 모드 자동 비활성 가드**: 타임아웃·하드TP·타이트SL·트레일링·**불타기(피라미딩)**. 피라미딩은 IS/OOS 분리 검증에서 과최적 기각(검증구간 전 지표 열위) — 재검토 시 `python scripts/audit_trend_fidelity.py --split-only` 재실행.
-- **실전 전 점검**: `python scripts/preflight.py` (One-Way 모드·레버리지·DB신선도·API키 등).
+- **실전 전 점검**: `python scripts/preflight.py` (One-Way 모드·레버리지·DB신선도·API키 등). 라이브 전환 절차·통과 기준은 `docs/LIVE_RUNBOOK.md`.
+- **주문 경로 안전 테스트**: `.venv/bin/python -m pytest -q scripts/test_order_safety.py` — 주문 파이프라인/브레이커 수정 후 필수. 원칙: 상태 불명(포지션 조회 실패·Redis 불가·시세 정지)이면 **신규 진입은 막고(fail-closed) 청산은 reduceOnly로 계속**, 실패는 반드시 텔레그램 경보.
 - **검증 도구**: `scripts/backtest_live.py`(라이브 로직 충실 재현), `signal_research.py`/`regime_validation.py`/`portfolio_backtest.py`(엣지·국면·분산 검증), `fetch_ohlcv.py`(데이터 수집).
 - **WS 한계(기존)**: Celery prefork 멀티프로세스라 WS 인메모리 큐를 태스크가 공유 못 해 REST 폴백. 4h 전략엔 무해(신호는 DB 기반).
 
